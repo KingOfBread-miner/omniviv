@@ -166,18 +166,14 @@ button {
     }
 }
 
-/* MapLibre popup close button customization */
-.maplibregl-popup-close-button {
-    font-size: 28px !important;
-    width: 36px !important;
-    height: 36px !important;
+/* MapLibre popup customization - remove default styling */
+.maplibregl-popup-content {
     padding: 0 !important;
-    margin: 4px 8px 0 0 !important;
-    line-height: 36px !important;
+    background: transparent !important;
+    box-shadow: none !important;
 }
 
-/* MapLibre popup content customization */
-.maplibregl-popup-content {
-    padding-top: 48px !important;
-    padding-right: 8px !important;
+/* Keep the popup tip/arrow styled */
+.maplibregl-popup-tip {
+    border-top-color: white !important;
 }
