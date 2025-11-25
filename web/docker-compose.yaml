@@ -1,0 +1,22 @@
+services:
+    projekt:
+        image: 127.0.0.1:5000/${PROJECT_NAME}
+        container_name: ${PROJECT_NAME}
+        restart: always
+        networks:
+            - rp
+        labels:
+            traefik.enable: "true"
+            traefik.http.routers.${PROJECT_NAME}.tls.certresolver: "default"
+            traefik.http.routers.${PROJECT_NAME}.tls.domains[0].main: ${DOMAIN}"
+            traefik.http.routers.${PROJECT_NAME}.tls.domains[0].sans: "*.${DOMAIN}"
+            traefik.http.routers.${PROJECT_NAME}.rule: "Host(`${SUBDOMAIN}.${DOMAIN}`)"
+            traefik.http.routers.${PROJECT_NAME}.entrypoints: "websecure"
+            traefik.http.services.${PROJECT_NAME}.loadbalancer.server.port: "80"
+            traefik.docker.network: rp
+            com.centurylinklabs.watchtower.enable: true
+            turing.public:
+
+networks:
+    rp:
+        name: rp

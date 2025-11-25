@@ -1,0 +1,19 @@
+{
+  "options": {
+    "paths": {
+      "root": "/data",
+      "fonts": "fonts",
+      "sprites": "sprites",
+      "styles": "styles",
+      "mbtiles": "/data"
+    },
+    "serveAllFonts": true,
+    "serveAllStyles": true
+  },
+  "styles": {},
+  "data": {
+    "bavaria": {
+      "mbtiles": "tiles.mbtiles"
+    }
+  }
+}
