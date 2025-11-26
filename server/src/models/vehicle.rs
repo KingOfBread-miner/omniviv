@@ -37,10 +37,13 @@ pub struct VehiclePosition {
 /// Basic vehicle information extracted from stop events
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VehicleInfo {
-    /// Unique vehicle/trip identifier (tripCode from EFA)
+    /// Unique trip identifier (tripCode as string)
     pub vehicle_id: String,
     /// Original tripCode from EFA API
-    pub trip_code: Option<i64>,
+    pub trip_code: i64,
+    /// Physical vehicle ID from EFA (e.g., "TW123")
+    pub physical_vehicle_id: Option<String>,
+
     /// Line number (e.g., "1", "2", "3")
     pub line_number: String,
     /// Line name (e.g., "Straßenbahn 1")
@@ -49,12 +52,34 @@ pub struct VehicleInfo {
     pub destination: String,
     /// Origin station name
     pub origin: Option<String>,
+
+    /// Current stop IFOPT reference where vehicle was last seen
+    pub current_stop_id: String,
+    /// Current stop name
+    pub current_stop_name: String,
+    /// Next stop IFOPT reference (first in onward_locations)
+    pub next_stop_id: Option<String>,
+    /// Next stop name
+    pub next_stop_name: Option<String>,
+
+    /// Last planned departure time (ISO 8601)
+    pub last_departure_planned: String,
+    /// Last estimated departure time (ISO 8601)
+    pub last_departure_estimated: Option<String>,
+    /// Delay in minutes
+    pub delay_minutes: Option<i32>,
+
     /// Whether this vehicle is stale (not found in recent queries)
     pub is_stale: bool,
     /// Timestamp when this vehicle was last seen (ISO 8601)
     pub last_seen: String,
     /// Timestamp when this vehicle was first seen (ISO 8601)
     pub first_seen: String,
+
+    /// List of upcoming stop IDs (from onward_locations)
+    pub stops_ahead: Vec<String>,
+    /// List of previous stop IDs (from previous_locations)
+    pub stops_behind: Vec<String>,
 }
 
 /// Response containing list of all unique vehicles on the network

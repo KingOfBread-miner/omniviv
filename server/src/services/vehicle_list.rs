@@ -1,103 +1,160 @@
 /// Vehicle listing service
 ///
 /// This module extracts a list of all unique vehicles currently on the network
-/// from the stop events cache. This is a simpler operation than full position
-/// estimation - it just identifies which vehicles are active.
+/// from the stop events cache using a time-window based approach.
 ///
-/// Vehicle IDs are composed of: transportationId_destinationId (e.g., "avg:03003: :H:j25_de:09761:200")
-/// Only vehicles with a tripCode are tracked.
+/// # Approach
+/// Instead of maintaining state over time, this service:
+/// 1. Filters stop events by departure time (recent past + near future)
+/// 2. Extracts unique vehicles from this time window
+/// 3. Deduplicates by keeping the latest departure
+///
+/// This ensures we only show vehicles that are currently active or about to depart.
 use crate::models::{VehicleInfo, VehicleListResponse};
 use crate::services::efa::EfaDepartureMonitorResponse;
 use std::collections::HashMap;
 use tracing::info;
 
-/// Extract all unique vehicles from stop events cache with stale tracking
+/// Extract currently active vehicles from stop events cache using time-window filtering
 ///
-/// This function scans all stop events from all stations and builds a HashMap
-/// of unique vehicles identified by combining their transportation.id and destination.id.
-/// Only vehicles with a tripCode are tracked. It maintains state from previous calls,
-/// marking vehicles as stale if they're not found in the current query, and removing
-/// them after a configurable timeout.
+/// This function uses a stateless, time-window based approach to identify vehicles
+/// that are currently on the network. Only stop events within a specific time window
+/// (recent past + near future) are considered.
+///
+/// # Time Window
+/// - Past: -20 minutes (vehicles that recently departed)
+/// - Future: +20 minutes (vehicles about to depart)
+/// - Total window: 40 minutes around current time
+///
+/// # Vehicle Identification
+/// - Uses tripCode as the unique identifier (one trip = one vehicle entry)
+/// - Physical vehicle_id stored separately if available
+/// - Only tracks vehicles with tripCode
+///
+/// # Deduplication
+/// When the same tripCode appears at multiple stops:
+/// - Keeps the entry with the LATEST departure time
+/// - Rationale: Vehicle progresses forward, latest = most current position
 ///
 /// # Arguments
 /// * `stop_events` - HashMap of station_id -> EfaDepartureMonitorResponse
-/// * `previous_vehicles` - Optional previous vehicle list to maintain state
-/// * `stale_timeout_seconds` - How long to keep stale vehicles before removing (default: 300s = 5min)
 ///
 /// # Returns
-/// VehicleListResponse containing all unique vehicles with stale tracking
+/// VehicleListResponse containing currently active vehicles
 pub fn extract_unique_vehicles(
     stop_events: &HashMap<String, EfaDepartureMonitorResponse>,
-    previous_vehicles: Option<&HashMap<String, VehicleInfo>>,
-    stale_timeout_seconds: u64,
+    _previous_vehicles: Option<&HashMap<String, VehicleInfo>>,
+    _stale_timeout_seconds: u64,
 ) -> VehicleListResponse {
     let now = chrono::Utc::now();
     let timestamp = now.to_rfc3339();
     let mut vehicles: HashMap<String, VehicleInfo> = HashMap::new();
 
-    // Build set of vehicle IDs found in current query
-    let mut found_vehicle_ids = std::collections::HashSet::new();
+    // Define time window for "currently active" vehicles
+    let time_window_past_minutes = 20; // Include vehicles that departed up to 20 min ago
+    let time_window_future_minutes = 20; // Include vehicles departing up to 20 min from now
+
+    let window_start = now - chrono::Duration::minutes(time_window_past_minutes);
+    let window_end = now + chrono::Duration::minutes(time_window_future_minutes);
 
     let total_stop_events: usize = stop_events.values().map(|r| r.stop_events.len()).sum();
     info!(
-        "Extracting unique vehicles from {} stations with {} total stop events",
-        stop_events.len(),
-        total_stop_events
+        stations = stop_events.len(),
+        stop_events = total_stop_events,
+        time_window = format!("-{} to +{} minutes", time_window_past_minutes, time_window_future_minutes),
+        "Extracting currently active vehicles using time-window filter"
     );
 
-    let mut skipped_duplicate = 0;
     let mut skipped_no_tripcode = 0;
-    let mut new_vehicles = 0;
-    let mut updated_vehicles = 0;
+    let mut skipped_outside_window = 0;
+    let mut replaced_with_later = 0;
 
     // Process each station's stop events
-    for (station_id, response) in stop_events {
+    for (_station_id, response) in stop_events {
         for stop_event in &response.stop_events {
             // Only track vehicles with tripCode
-            if stop_event.transportation.trip_code.is_none() {
-                skipped_no_tripcode += 1;
-                continue;
-            }
-
-            // Generate vehicle ID from transportation.id and destination.id
-            let vehicle_id = match &stop_event.transportation.destination.id {
-                Some(dest_id) => {
-                    // Combine transportation.id and destination.id for unique identification
-                    format!("{}_{}", stop_event.transportation.id, dest_id)
-                }
+            let trip_code = match stop_event.transportation.trip_code {
+                Some(tc) => tc,
                 None => {
-                    // Fallback: use transportation.id only if destination has no id
-                    stop_event.transportation.id.clone()
+                    skipped_no_tripcode += 1;
+                    continue;
                 }
             };
 
-            // Check if we already processed this vehicle in current query
-            // Keep the first one we find
-            if vehicles.contains_key(&vehicle_id) {
-                skipped_duplicate += 1;
+            // Parse departure time for time-window filtering
+            let departure_time_str = stop_event
+                .departure_time_estimated
+                .as_ref()
+                .or(stop_event.departure_time_planned.as_ref());
+
+            let departure_time = match departure_time_str.and_then(|dt_str| {
+                chrono::DateTime::parse_from_rfc3339(dt_str)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            }) {
+                Some(dt) => dt,
+                None => {
+                    // No valid departure time, skip
+                    skipped_outside_window += 1;
+                    continue;
+                }
+            };
+
+            // TIME WINDOW FILTER: Only include vehicles within the active time window
+            if departure_time < window_start || departure_time > window_end {
+                skipped_outside_window += 1;
                 continue;
             }
 
-            found_vehicle_ids.insert(vehicle_id.clone());
+            // Generate vehicle ID from tripCode (one trip = one vehicle entry)
+            let vehicle_id = trip_code.to_string();
 
-            // Check if this vehicle existed before
-            let first_seen = if let Some(prev_vehicles) = previous_vehicles {
-                if let Some(prev_vehicle) = prev_vehicles.get(&vehicle_id) {
-                    updated_vehicles += 1;
-                    prev_vehicle.first_seen.clone()
-                } else {
-                    new_vehicles += 1;
-                    timestamp.clone()
+            // Check if we already have this vehicle in current batch
+            if let Some(existing) = vehicles.get(&vehicle_id) {
+                // Compare departure times - keep the one with LATER departure
+                let existing_departure = chrono::DateTime::parse_from_rfc3339(&existing.last_departure_planned)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+
+                if let Some(existing_dt) = existing_departure {
+                    if departure_time > existing_dt {
+                        // Current stop event is later, replace existing
+                        replaced_with_later += 1;
+                    } else {
+                        // Existing is later or same, keep it
+                        continue;
+                    }
                 }
-            } else {
-                new_vehicles += 1;
-                timestamp.clone()
-            };
+            }
 
-            // Extract basic vehicle information
+            // Extract next stop information (first in onward_locations)
+            let (next_stop_id, next_stop_name) = stop_event
+                .onward_locations
+                .as_ref()
+                .and_then(|locs| locs.first())
+                .map(|loc| (Some(loc.id.clone()), Some(loc.name.clone())))
+                .unwrap_or((None, None));
+
+            // Extract stops ahead (future stops)
+            let stops_ahead = stop_event
+                .onward_locations
+                .as_ref()
+                .map(|locs| locs.iter().map(|loc| loc.id.clone()).collect())
+                .unwrap_or_else(Vec::new);
+
+            // Extract stops behind (past stops)
+            let stops_behind = stop_event
+                .previous_locations
+                .as_ref()
+                .map(|locs| locs.iter().map(|loc| loc.id.clone()).collect())
+                .unwrap_or_else(Vec::new);
+
+            // Build comprehensive vehicle information
             let vehicle_info = VehicleInfo {
                 vehicle_id: vehicle_id.clone(),
-                trip_code: stop_event.transportation.trip_code,
+                trip_code,
+                physical_vehicle_id: stop_event.transportation.vehicle_id.clone(),
+
                 line_number: stop_event.transportation.number.clone(),
                 line_name: stop_event.transportation.name.clone(),
                 destination: stop_event.transportation.destination.name.clone(),
@@ -106,66 +163,42 @@ pub fn extract_unique_vehicles(
                     .origin
                     .as_ref()
                     .map(|o| o.name.clone()),
-                is_stale: false,
+
+                current_stop_id: stop_event.location.id.clone(),
+                current_stop_name: stop_event.location.name.clone(),
+                next_stop_id,
+                next_stop_name,
+
+                last_departure_planned: stop_event
+                    .departure_time_planned
+                    .clone()
+                    .unwrap_or_else(|| timestamp.clone()),
+                last_departure_estimated: stop_event.departure_time_estimated.clone(),
+                delay_minutes: stop_event.departure_delay,
+
+                is_stale: false, // Not used in time-window approach
                 last_seen: timestamp.clone(),
-                first_seen,
+                first_seen: timestamp.clone(), // Not tracked in stateless approach
+
+                stops_ahead,
+                stops_behind,
             };
 
             vehicles.insert(vehicle_id, vehicle_info);
         }
     }
 
-    // Mark vehicles from previous state as stale if not found, or remove if too old
-    let mut removed_vehicles = 0;
-
-    if let Some(prev_vehicles) = previous_vehicles {
-        for (vehicle_id, prev_vehicle) in prev_vehicles {
-            // Skip if we already have this vehicle (it was found in current query)
-            if vehicles.contains_key(vehicle_id) {
-                continue;
-            }
-
-            // Check if this vehicle has been stale for too long
-            if let Ok(last_seen_time) =
-                chrono::DateTime::parse_from_rfc3339(&prev_vehicle.last_seen)
-            {
-                let stale_duration = now.signed_duration_since(last_seen_time);
-
-                if stale_duration.num_seconds() > stale_timeout_seconds as i64 {
-                    // Vehicle has been stale too long, don't include it
-                    removed_vehicles += 1;
-                    info!(
-                        vehicle_id = %vehicle_id,
-                        line = %prev_vehicle.line_number,
-                        destination = %prev_vehicle.destination,
-                        stale_duration_seconds = stale_duration.num_seconds(),
-                        "Removing stale vehicle (timeout)"
-                    );
-                    continue;
-                }
-            }
-
-            // Keep the vehicle but mark as stale
-            let mut stale_vehicle = prev_vehicle.clone();
-            stale_vehicle.is_stale = true;
-            vehicles.insert(vehicle_id.clone(), stale_vehicle);
-        }
-    }
-
     let total_count = vehicles.len();
-    let active_count = vehicles.values().filter(|v| !v.is_stale).count();
-    let stale_count = vehicles.values().filter(|v| v.is_stale).count();
+    let active_count = total_count; // All vehicles in time window are active
+    let stale_count = 0; // No stale tracking in time-window approach
 
     info!(
-        total_vehicles = total_count,
+        total = total_count,
         active = active_count,
-        stale = stale_count,
-        new = new_vehicles,
-        updated = updated_vehicles,
-        removed = removed_vehicles,
-        duplicates_skipped = skipped_duplicate,
+        replaced = replaced_with_later,
         skipped_no_tripcode = skipped_no_tripcode,
-        "Vehicle list updated (tripCode only)"
+        skipped_outside_window = skipped_outside_window,
+        "Vehicle list extracted using time-window filter"
     );
 
     VehicleListResponse {

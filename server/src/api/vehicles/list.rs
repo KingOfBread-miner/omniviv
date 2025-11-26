@@ -8,22 +8,42 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// Get list of all unique vehicles currently on the network
+/// Get list of all currently active vehicles on the network
 ///
-/// This endpoint returns a list of all unique vehicles with stale tracking.
-/// Vehicles are marked as stale when they're not found in recent stop events,
-/// and are removed after 5 minutes of being stale. This is useful for:
-/// - Verifying the cache is populated
-/// - Seeing which vehicles are currently active vs stale
-/// - Debugging the vehicle tracking system
+/// This endpoint returns comprehensive information about all vehicles currently
+/// operating in the tram system using a time-window based approach.
 ///
-/// The list is served from an in-memory cache that's updated every 5 seconds
-/// along with the stop events cache.
+/// # Time-Window Filtering
+/// Only vehicles with departures within the active time window are included:
+/// - **Past**: -20 minutes (recently departed, still on route)
+/// - **Future**: +20 minutes (about to depart)
+/// - **Total window**: 40 minutes around current time
+///
+/// This ensures only currently active or soon-to-depart vehicles are shown.
+///
+/// # Vehicle Identification
+/// - Each vehicle is identified by its `tripCode` (unique trip identifier)
+/// - Physical vehicle ID stored separately when available
+/// - One trip = one vehicle entry
+///
+/// # Information Provided
+/// - Current location (platform IFOPT and name)
+/// - Next stop and upcoming stops
+/// - Previous stops (journey history)
+/// - Departure times (planned and estimated)
+/// - Delay information
+/// - Line number, destination, and origin
+///
+/// # Expected Count
+/// Should show ~40-60 vehicles during operational hours, matching the active fleet.
+///
+/// # Update Frequency
+/// The vehicle list is recalculated every 5 seconds from the stop events cache (stateless).
 #[utoipa::path(
     get,
     path = "/api/vehicles/list",
     responses(
-        (status = 200, description = "List of all unique vehicles with stale tracking", body = VehicleListResponse)
+        (status = 200, description = "Comprehensive list of all vehicles with location, timing, and journey context", body = VehicleListResponse)
     ),
     tag = "vehicles"
 )]
