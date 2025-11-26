@@ -20,33 +20,93 @@ interface SystemInfo {
     timestamp: string;
 }
 
+interface VehicleInfo {
+    vehicle_id: string;
+    trip_code: number | null;
+    line_number: string;
+    line_name: string;
+    destination: string;
+    origin: string | null;
+    is_stale: boolean;
+    last_seen: string;
+    first_seen: string;
+}
+
+interface VehicleListResponse {
+    vehicles: Record<string, VehicleInfo>;
+    total_count: number;
+    active_count: number;
+    stale_count: number;
+    timestamp: string;
+}
+
+interface PlatformInfo {
+    id: string;
+    name: string;
+    station_name: string;
+}
+
+interface LineWithPlatforms {
+    line_number: string;
+    platforms: PlatformInfo[];
+}
+
+interface LinesListResponse {
+    lines: LineWithPlatforms[];
+    total_lines: number;
+    timestamp: string;
+}
+
 export default function SystemInfo() {
     const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
+    const [vehicleList, setVehicleList] = useState<VehicleListResponse | null>(null);
+    const [linesList, setLinesList] = useState<LinesListResponse | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [isExpanded, setIsExpanded] = useState(true);
+    const [isVehiclesExpanded, setIsVehiclesExpanded] = useState(false);
+    const [isLinesExpanded, setIsLinesExpanded] = useState(false);
+    const [expandedLines, setExpandedLines] = useState<Set<string>>(new Set());
 
     useEffect(() => {
-        const fetchSystemInfo = async () => {
+        const fetchData = async () => {
             try {
-                const response = await fetch('http://localhost:3000/api/system/info');
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+                // Fetch system info, vehicle list, and lines list in parallel
+                const [systemInfoResponse, vehiclesResponse, linesResponse] = await Promise.all([
+                    fetch('http://localhost:3000/api/system/info'),
+                    fetch('http://localhost:3000/api/vehicles/list'),
+                    fetch('http://localhost:3000/api/lines/list')
+                ]);
+
+                if (!systemInfoResponse.ok) {
+                    throw new Error(`System info HTTP ${systemInfoResponse.status}`);
                 }
-                const data: SystemInfo = await response.json();
-                setSystemInfo(data);
+                if (!vehiclesResponse.ok) {
+                    throw new Error(`Vehicles HTTP ${vehiclesResponse.status}`);
+                }
+                if (!linesResponse.ok) {
+                    throw new Error(`Lines HTTP ${linesResponse.status}`);
+                }
+
+                const systemData: SystemInfo = await systemInfoResponse.json();
+                const vehiclesData: VehicleListResponse = await vehiclesResponse.json();
+                const linesData: LinesListResponse = await linesResponse.json();
+
+                setSystemInfo(systemData);
+                setVehicleList(vehiclesData);
+                setLinesList(linesData);
                 setError(null);
             } catch (err) {
-                console.error('Failed to fetch system info:', err);
+                console.error('Failed to fetch data:', err);
                 setError(err instanceof Error ? err.message : 'Failed to fetch');
             } finally {
                 setLoading(false);
             }
         };
 
-        fetchSystemInfo();
+        fetchData();
         // Refresh every 5 seconds
-        const interval = setInterval(fetchSystemInfo, 5000);
+        const interval = setInterval(fetchData, 5000);
         return () => clearInterval(interval);
     }, []);
 
@@ -238,6 +298,197 @@ export default function SystemInfo() {
                         <span className="font-semibold">{systemInfo.cache_update_interval_seconds}s</span>
                     </div>
                 </div>
+            </div>
+
+            {/* Vehicles List */}
+            <div>
+                <button
+                    onClick={() => setIsVehiclesExpanded(!isVehiclesExpanded)}
+                    className="w-full flex items-center justify-between hover:bg-gray-50 rounded p-2 transition-colors"
+                >
+                    <div className="flex items-center gap-2">
+                        <h4 className="font-semibold text-sm text-gray-700">
+                            All Vehicles ({vehicleList?.total_count || 0})
+                        </h4>
+                        {vehicleList && (
+                            <div className="flex items-center gap-1 text-xs">
+                                <span className="text-green-600 font-semibold">
+                                    {vehicleList.active_count} active
+                                </span>
+                                {vehicleList.stale_count > 0 && (
+                                    <>
+                                        <span className="text-gray-400">•</span>
+                                        <span className="text-orange-600 font-semibold">
+                                            {vehicleList.stale_count} stale
+                                        </span>
+                                    </>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                    <svg
+                        width="16"
+                        height="16"
+                        viewBox="0 0 16 16"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        className={`transition-transform ${isVehiclesExpanded ? 'rotate-180' : ''}`}
+                    >
+                        <path d="M4 6l4 4 4-4" />
+                    </svg>
+                </button>
+
+                {isVehiclesExpanded && vehicleList && (
+                    <div className="mt-2 space-y-2 max-h-96 overflow-y-auto">
+                        {Object.entries(vehicleList.vehicles)
+                            .sort(([, a], [, b]) => {
+                                // Sort: active first, then by line number, then by destination
+                                if (a.is_stale !== b.is_stale) {
+                                    return a.is_stale ? 1 : -1;
+                                }
+                                const lineCompare = parseInt(a.line_number) - parseInt(b.line_number);
+                                if (lineCompare !== 0) return lineCompare;
+                                return a.destination.localeCompare(b.destination);
+                            })
+                            .map(([vehicleId, vehicle]) => (
+                                <div
+                                    key={vehicleId}
+                                    className={`rounded p-2 text-xs border ${
+                                        vehicle.is_stale
+                                            ? 'bg-orange-50 border-orange-300'
+                                            : 'bg-gray-50 border-gray-200'
+                                    }`}
+                                >
+                                    <div className="flex items-start justify-between gap-2">
+                                        <div className="flex-1 min-w-0">
+                                            <div className="flex items-center gap-2 mb-1">
+                                                <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full text-white font-bold text-xs ${
+                                                    vehicle.is_stale ? 'bg-orange-500 opacity-60' : 'bg-blue-600'
+                                                }`}>
+                                                    {vehicle.line_number}
+                                                </span>
+                                                <span className={`font-semibold truncate ${
+                                                    vehicle.is_stale ? 'text-gray-600' : 'text-gray-900'
+                                                }`}>
+                                                    → {vehicle.destination}
+                                                </span>
+                                                {vehicle.is_stale && (
+                                                    <span className="text-xs font-semibold text-orange-600 bg-orange-100 px-1.5 py-0.5 rounded">
+                                                        STALE
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {vehicle.origin && (
+                                                <div className={`truncate ml-8 ${
+                                                    vehicle.is_stale ? 'text-gray-500' : 'text-gray-600'
+                                                }`}>
+                                                    from {vehicle.origin}
+                                                </div>
+                                            )}
+                                            <div className="text-gray-500 truncate ml-8 mt-1 text-[10px]">
+                                                ID: {vehicleId}
+                                            </div>
+                                            {vehicle.is_stale && (
+                                                <div className="text-orange-600 truncate ml-8 mt-1 text-[10px]">
+                                                    Last seen: {new Date(vehicle.last_seen).toLocaleTimeString()}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                    </div>
+                )}
+            </div>
+
+            {/* Tram Lines List */}
+            <div>
+                <button
+                    onClick={() => setIsLinesExpanded(!isLinesExpanded)}
+                    className="w-full flex items-center justify-between hover:bg-gray-50 rounded p-2 transition-colors"
+                >
+                    <div className="flex items-center gap-2">
+                        <h4 className="font-semibold text-sm text-gray-700">
+                            Tram Lines ({linesList?.total_lines || 0})
+                        </h4>
+                    </div>
+                    <svg
+                        width="16"
+                        height="16"
+                        viewBox="0 0 16 16"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        className={`transition-transform ${isLinesExpanded ? 'rotate-180' : ''}`}
+                    >
+                        <path d="M4 6l4 4 4-4" />
+                    </svg>
+                </button>
+
+                {isLinesExpanded && linesList && (
+                    <div className="mt-2 space-y-2 max-h-96 overflow-y-auto">
+                        {linesList.lines.filter(line => line.platforms && line.platforms.length > 0).map((line) => (
+                            <div key={line.line_number} className="rounded border border-gray-200">
+                                <button
+                                    onClick={() => {
+                                        const newExpanded = new Set(expandedLines);
+                                        if (newExpanded.has(line.line_number)) {
+                                            newExpanded.delete(line.line_number);
+                                        } else {
+                                            newExpanded.add(line.line_number);
+                                        }
+                                        setExpandedLines(newExpanded);
+                                    }}
+                                    className="w-full flex items-center justify-between p-2 hover:bg-gray-50 transition-colors"
+                                >
+                                    <div className="flex items-center gap-2">
+                                        <span className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-600 text-white font-bold text-sm">
+                                            {line.line_number}
+                                        </span>
+                                        <span className="text-sm text-gray-600">
+                                            {line.platforms?.length || 0} platforms
+                                        </span>
+                                    </div>
+                                    <svg
+                                        width="14"
+                                        height="14"
+                                        viewBox="0 0 16 16"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        strokeWidth="2"
+                                        strokeLinecap="round"
+                                        className={`transition-transform ${expandedLines.has(line.line_number) ? 'rotate-180' : ''}`}
+                                    >
+                                        <path d="M4 6l4 4 4-4" />
+                                    </svg>
+                                </button>
+
+                                {expandedLines.has(line.line_number) && line.platforms && (
+                                    <div className="px-2 pb-2 space-y-1">
+                                        {line.platforms.map((platform, idx) => (
+                                            <div
+                                                key={platform.id}
+                                                className="text-xs bg-gray-50 rounded px-2 py-1.5"
+                                            >
+                                                <div className="flex items-start gap-2">
+                                                    <span className="text-gray-400 font-semibold mt-0.5">{idx + 1}.</span>
+                                                    <div className="flex-1">
+                                                        <div className="text-gray-900 font-semibold">{platform.station_name}</div>
+                                                        <div className="text-gray-600 text-[11px] mt-0.5">{platform.name}</div>
+                                                        <div className="text-gray-400 font-mono text-[10px] mt-0.5">{platform.id}</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        ))}
+                    </div>
+                )}
             </div>
 
             <div className="pt-2 border-t border-gray-200">

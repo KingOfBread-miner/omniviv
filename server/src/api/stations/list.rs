@@ -9,7 +9,7 @@ use axum::{
     get,
     path = "/api/stations",
     responses(
-        (status = 200, description = "Map of all tram stations with EFA and OSM data (keyed by station_id)")
+        (status = 200, description = "Map of all tram stations with platforms from OSM (keyed by station_id, platforms include ref:IFOPT tags)")
     ),
     tag = "stations"
 )]

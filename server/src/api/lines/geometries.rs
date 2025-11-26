@@ -54,7 +54,7 @@ pub async fn get_line_geometry(
         .collect();
 
     // Use cached geometries
-    let way_map = &*state.geometry_cache;
+    let way_map = &*state.geometry;
 
     // Build segments from cached geometries
     let segments: Vec<Vec<[f64; 2]>> = all_way_ids
@@ -129,7 +129,7 @@ pub async fn get_line_geometries(
     }
 
     // Use cached geometries
-    let way_map = &*state.geometry_cache;
+    let way_map = &*state.geometry;
 
     // Build line geometries
     let line_geometries: Vec<LineGeometry> = line_ways

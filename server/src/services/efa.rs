@@ -115,10 +115,9 @@
 /// - Response times are typically under 1 second
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{debug, info, warn};
+use tracing::{info, trace};
 
 const EFA_BASE_URL: &str = "https://bahnland-bayern.de/efa/XML_DM_REQUEST";
-const EFA_STOPFINDER_URL: &str = "https://bahnland-bayern.de/efa/XML_STOPFINDER_REQUEST";
 
 /// Platform information with OSM data
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -137,11 +136,15 @@ pub struct Platform {
 pub struct Station {
     pub station_id: String,
     pub station_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_name: Option<String>,
     pub coord: Option<Vec<f64>>,
     pub platforms: Vec<Platform>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EfaLocation {
     pub id: String,
     #[serde(rename = "isGlobalId")]
@@ -156,7 +159,7 @@ pub struct EfaLocation {
     pub product_classes: Option<Vec<i32>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EfaProduct {
     pub id: i32,
     pub class: i32,
@@ -165,7 +168,7 @@ pub struct EfaProduct {
     pub icon_id: Option<i32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EfaDestination {
     pub id: Option<String>,
     pub name: String,
@@ -173,17 +176,66 @@ pub struct EfaDestination {
     pub dest_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct EfaTransportation {
     pub id: String,
     pub name: String,
     pub number: String,
+    pub trip_code: Option<i64>,
+    pub vehicle_id: Option<String>,
     pub product: EfaProduct,
     pub destination: EfaDestination,
     pub origin: Option<EfaDestination>,
+    /// Catch-all for any additional fields not explicitly mapped
+    pub additional_fields: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl<'de> Deserialize<'de> for EfaTransportation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct EfaTransportationHelper {
+            id: String,
+            name: String,
+            number: String,
+            #[serde(rename = "tripCode")]
+            trip_code: Option<i64>,
+            #[serde(rename = "vehicleId")]
+            vehicle_id: Option<String>,
+            product: EfaProduct,
+            destination: EfaDestination,
+            origin: Option<EfaDestination>,
+            #[serde(flatten)]
+            additional_fields: serde_json::Value,
+        }
+
+        let helper = EfaTransportationHelper::deserialize(deserializer)?;
+
+        // Extract tripCode from properties if not at top level
+        let trip_code = helper.trip_code.or_else(|| {
+            helper.additional_fields
+                .get("properties")
+                .and_then(|p| p.get("tripCode"))
+                .and_then(|tc| tc.as_i64())
+        });
+
+        Ok(EfaTransportation {
+            id: helper.id,
+            name: helper.name,
+            number: helper.number,
+            trip_code,
+            vehicle_id: helper.vehicle_id,
+            product: helper.product,
+            destination: helper.destination,
+            origin: helper.origin,
+            additional_fields: helper.additional_fields,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EfaInfoLink {
     #[serde(rename = "urlText")]
     pub url_text: Option<String>,
@@ -192,7 +244,7 @@ pub struct EfaInfoLink {
     pub subtitle: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EfaInfo {
     pub priority: String,
     pub id: String,
@@ -203,7 +255,28 @@ pub struct EfaInfo {
     pub info_links: Option<Vec<EfaInfoLink>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct EfaOnwardLocation {
+    pub id: String,
+    #[serde(rename = "isGlobalId")]
+    pub is_global_id: Option<bool>,
+    pub name: String,
+    #[serde(rename = "disassembledName")]
+    pub disassembled_name: Option<String>,
+    pub coord: Option<Vec<f64>>,
+    #[serde(rename = "type")]
+    pub location_type: Option<String>,
+    #[serde(rename = "arrivalTimePlanned")]
+    pub arrival_time_planned: Option<String>,
+    #[serde(rename = "arrivalTimeEstimated")]
+    pub arrival_time_estimated: Option<String>,
+    #[serde(rename = "departureTimePlanned")]
+    pub departure_time_planned: Option<String>,
+    #[serde(rename = "departureTimeEstimated")]
+    pub departure_time_estimated: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EfaStopEvent {
     pub location: EfaLocation,
     #[serde(rename = "departureTimePlanned")]
@@ -220,9 +293,13 @@ pub struct EfaStopEvent {
     pub arrival_delay: Option<i32>,
     pub transportation: EfaTransportation,
     pub infos: Option<Vec<EfaInfo>>,
+    #[serde(rename = "onwardLocations")]
+    pub onward_locations: Option<Vec<EfaOnwardLocation>>,
+    #[serde(rename = "previousLocations")]
+    pub previous_locations: Option<Vec<EfaOnwardLocation>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EfaDepartureMonitorResponse {
     pub version: String,
     pub locations: Vec<EfaLocation>,
@@ -230,184 +307,49 @@ pub struct EfaDepartureMonitorResponse {
     pub stop_events: Vec<EfaStopEvent>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct EfaStopFinderResponse {
-    pub version: String,
-    pub locations: Vec<EfaLocation>,
-}
-
-/// Search for stations by name
-///
-/// # Arguments
-/// * `search_term` - Station name to search for (e.g., "Augsburg Königsplatz")
-///
-/// # Returns
-/// List of matching locations with their IDs
-pub async fn search_stations(
-    search_term: &str,
-) -> Result<Vec<EfaLocation>, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!(
-        "{}?outputFormat=rapidJSON&type_sf=any&name_sf={}",
-        EFA_STOPFINDER_URL,
-        urlencoding::encode(search_term)
-    );
-
-    debug!(url = %url, "Searching for stations");
-
-    let client = reqwest::Client::new();
-    let response = client.get(&url).send().await?;
-
-    let data: EfaStopFinderResponse = response.json().await?;
-
-    info!(
-        count = data.locations.len(),
-        search_term = %search_term,
-        "Found stations"
-    );
-
-    Ok(data.locations)
-}
-
-/// Get all stops in a city/area
-///
-/// # Arguments
-/// * `city_name` - City name to search for (e.g., "Augsburg")
-/// * `tram_only` - If true, only return stops with tram service (productClass 4)
-///
-/// # Returns
-/// List of all stops in the area with coordinates in WGS84 format
-pub async fn get_all_stops(
-    city_name: &str,
-    tram_only: bool,
-) -> Result<Vec<EfaLocation>, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!(
-        "{}?outputFormat=rapidJSON&type_sf=any&name_sf={}&anyObjFilter_sf=2&coordOutputFormat=WGS84[DD.ddddd]",
-        EFA_STOPFINDER_URL,
-        urlencoding::encode(city_name)
-    );
-
-    debug!(url = %url, city_name = %city_name, "Fetching all stops");
-
-    let client = reqwest::Client::new();
-    let response = client.get(&url).send().await?;
-
-    let data: EfaStopFinderResponse = response.json().await?;
-
-    let stops = if tram_only {
-        // Filter to only include stops with tram service (productClass 4)
-        data.locations
-            .into_iter()
-            .filter(|loc| {
-                if let Some(product_classes) = &loc.product_classes {
-                    product_classes.contains(&4)
-                } else {
-                    false
-                }
-            })
-            .collect()
-    } else {
-        data.locations
-    };
-
-    info!(
-        count = stops.len(),
-        city_name = %city_name,
-        tram_only = tram_only,
-        "Retrieved stops"
-    );
-
-    Ok(stops)
-}
-
-/// Get departures for a specific station
+/// Get stop events for a station for caching
 ///
 /// # Arguments
 /// * `station_id` - Station ID (e.g., "de:09761:101")
-/// * `limit` - Maximum number of results
-/// * `use_realtime` - Include real-time data
-/// * `tram_only` - If true, only show trams (product class 4)
+/// * `metrics` - Optional metrics tracker to record requests
 ///
 /// # Returns
-/// Departure monitor response with stop events
-pub async fn get_departures(
+/// Typed departure monitor response containing stop events
+pub async fn get_stop_events(
     station_id: &str,
-    limit: u32,
-    use_realtime: bool,
-    tram_only: bool,
+    metrics: Option<&super::metrics::MetricsTracker>,
 ) -> Result<EfaDepartureMonitorResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let mut url = format!(
-        "{}?mode=direct&name_dm={}&type_dm=stop&depType=stopEvents&outputFormat=rapidJSON&limit={}",
+    let url = format!(
+        "{}?mode=direct&name_dm={}&type_dm=stop&depType=stopEvents&outputFormat=rapidJSON&limit=20&useRealtime=1&includedMeans=4&coordOutputFormat=EPSG:4326&includeCompleteStopSeq=1",
         EFA_BASE_URL,
-        urlencoding::encode(station_id),
-        limit
+        urlencoding::encode(station_id)
     );
 
-    if use_realtime {
-        url.push_str("&useRealtime=1");
-    }
+    trace!(url = %url, station_id = %station_id, "Fetching stop events for cache");
 
-    if tram_only {
-        url.push_str("&includedMeans=4");
+    // Record request in metrics
+    if let Some(m) = metrics {
+        m.record_request().await;
     }
-
-    debug!(url = %url, station_id = %station_id, "Fetching departures");
 
     let client = reqwest::Client::new();
     let response = client.get(&url).send().await?;
 
-    let data: EfaDepartureMonitorResponse = response.json().await?;
-
-    info!(
-        station_id = %station_id,
-        events = data.stop_events.len(),
-        "Retrieved departures"
-    );
-
-    Ok(data)
-}
-
-/// Get arrivals for a specific station
-///
-/// # Arguments
-/// * `station_id` - Station ID (e.g., "de:09761:101")
-/// * `limit` - Maximum number of results
-/// * `use_realtime` - Include real-time data
-/// * `tram_only` - If true, only show trams (product class 4)
-///
-/// # Returns
-/// Departure monitor response with stop events (containing arrival data)
-pub async fn get_arrivals(
-    station_id: &str,
-    limit: u32,
-    use_realtime: bool,
-    tram_only: bool,
-) -> Result<EfaDepartureMonitorResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let mut url = format!(
-        "{}?mode=direct&name_dm={}&type_dm=stop&depType=stopEvents&outputFormat=rapidJSON&limit={}&itdDateTimeDepArr=arr",
-        EFA_BASE_URL,
-        urlencoding::encode(station_id),
-        limit
-    );
-
-    if use_realtime {
-        url.push_str("&useRealtime=1");
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unable to read error body".to_string());
+        return Err(format!("HTTP {}: {}", status, error_body).into());
     }
-
-    if tram_only {
-        url.push_str("&includedMeans=4");
-    }
-
-    debug!(url = %url, station_id = %station_id, "Fetching arrivals");
-
-    let client = reqwest::Client::new();
-    let response = client.get(&url).send().await?;
 
     let data: EfaDepartureMonitorResponse = response.json().await?;
 
-    info!(
+    trace!(
         station_id = %station_id,
         events = data.stop_events.len(),
-        "Retrieved arrivals"
+        "Retrieved stop events for cache"
     );
 
     Ok(data)
@@ -432,12 +374,23 @@ pub async fn get_station_info(
         urlencoding::encode(station_id)
     );
 
-    debug!(url = %url, station_id = %station_id, "Fetching station info with stop events");
+    trace!(url = %url, station_id = %station_id, "Fetching station info with stop events");
 
     let client = reqwest::Client::new();
     let response = client.get(&url).send().await?;
 
-    let data: Value = response.json().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unable to read error body".to_string());
+        return Err(format!("HTTP {}: {}", status, error_body).into());
+    }
+
+    let response_text = response.text().await?;
+    let data: Value = serde_json::from_str(&response_text)
+        .map_err(|e| format!("JSON parse error: {}. Response body: {}", e, response_text))?;
 
     info!(station_id = %station_id, "Retrieved station info with stop events");
 
@@ -455,6 +408,77 @@ fn extract_station_id(ifopt_ref: &str) -> String {
     }
 }
 
+/// Fetch platform name from EFA API using IFOPT reference
+///
+/// Queries the EFA API with an IFOPT reference and extracts the platform name
+/// from the stop events response.
+///
+/// # Arguments
+/// * `ifopt_ref` - Full IFOPT reference (e.g., "de:09761:401:1:1")
+///
+/// # Returns
+/// Result with platform name or error
+pub async fn fetch_platform_name(ifopt_ref: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!(
+        "{}?mode=direct&name_dm={}&type_dm=stop&depType=stopEvents&outputFormat=rapidJSON&includeCompleteStopSeq=1&useRealtime=1&limit=1&includedMeans=4&coordOutputFormat=EPSG:4326",
+        EFA_BASE_URL,
+        urlencoding::encode(ifopt_ref)
+    );
+
+    let client = reqwest::Client::new();
+    let response = client.get(&url).send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}: Failed to fetch platform info", status).into());
+    }
+
+    let response_text = response.text().await?;
+    let data: Value = serde_json::from_str(&response_text)?;
+
+    // Try to extract platform name from the response
+    // First, try from stopEvents
+    if let Some(stop_events) = data.get("stopEvents").and_then(|se| se.as_array()) {
+        for event in stop_events {
+            if let Some(location) = event.get("location") {
+                let platform_id = location.get("id").and_then(|id| id.as_str());
+
+                // Check if this is the platform we're looking for
+                if platform_id == Some(ifopt_ref) {
+                    // Try to get platform name from disassembledName or properties.platformName
+                    if let Some(name) = location
+                        .get("disassembledName")
+                        .and_then(|n| n.as_str())
+                        .or_else(|| {
+                            location
+                                .get("properties")
+                                .and_then(|p| p.get("platformName"))
+                                .and_then(|n| n.as_str())
+                        })
+                    {
+                        return Ok(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: try from locations array
+    if let Some(locations) = data.get("locations").and_then(|l| l.as_array()) {
+        if let Some(location) = locations.first() {
+            if let Some(name) = location
+                .get("disassembledName")
+                .and_then(|n| n.as_str())
+                .or_else(|| location.get("name").and_then(|n| n.as_str()))
+            {
+                return Ok(name.to_string());
+            }
+        }
+    }
+
+    Err(format!("Could not extract platform name for {}", ifopt_ref).into())
+}
+
 /// Extract station and platform information from EFA response
 ///
 /// Transforms the raw EFA JSON response into a compact format with only
@@ -464,20 +488,53 @@ fn extract_station_id(ifopt_ref: &str) -> String {
 /// * `efa_response` - Raw JSON response from EFA API
 ///
 /// # Returns
-/// Station with station info and platform list
-pub fn extract_compact_station_data(efa_response: &Value) -> Option<Station> {
+/// Result with Station data or detailed error message
+pub fn extract_compact_station_data(efa_response: &Value) -> Result<Station, String> {
     // Extract station info from locations array
-    let locations = efa_response.get("locations")?.as_array()?;
+    let locations = efa_response
+        .get("locations")
+        .ok_or_else(|| "Missing 'locations' field in EFA response".to_string())?
+        .as_array()
+        .ok_or_else(|| "'locations' field is not an array".to_string())?;
+
     if locations.is_empty() {
-        warn!("No locations found in EFA response");
-        return None;
+        return Err(format!(
+            "Empty locations array in EFA response. Full response: {}",
+            serde_json::to_string_pretty(efa_response)
+                .unwrap_or_else(|_| "Unable to serialize".to_string())
+        ));
     }
 
     let station = &locations[0];
-    let full_id = station.get("id")?.as_str()?.to_string();
+    let full_id = station
+        .get("id")
+        .ok_or_else(|| "Missing 'id' field in station location".to_string())?
+        .as_str()
+        .ok_or_else(|| "'id' field is not a string".to_string())?
+        .to_string();
+
     // Extract parent station ID (first 3 parts of IFOPT)
     let station_id = extract_station_id(&full_id);
-    let station_name = station.get("name")?.as_str()?.to_string();
+
+    // Get both full name and short name
+    let full_name = station
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string());
+
+    let short_name = station
+        .get("disassembledName")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string());
+
+    // Use short_name if available, fallback to full_name for station_name
+    let station_name = short_name
+        .clone()
+        .or_else(|| full_name.clone())
+        .ok_or_else(|| {
+            "Missing 'disassembledName' and 'name' field in station location".to_string()
+        })?;
+
     let station_coord = station.get("coord").and_then(|c| {
         c.as_array().and_then(|arr| {
             if arr.len() >= 2 {
@@ -545,9 +602,11 @@ pub fn extract_compact_station_data(efa_response: &Value) -> Option<Station> {
         "Extracted station data"
     );
 
-    Some(Station {
+    Ok(Station {
         station_id,
         station_name,
+        full_name,
+        short_name,
         coord: station_coord,
         platforms,
     })
