@@ -1,5 +1,5 @@
 use crate::config::{Area, Config};
-use crate::providers::efa::{EfaClient, StopEventType};
+use crate::providers::efa::EfaClient;
 use crate::providers::osm::{OsmClient, OsmElement, OsmRoute};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -26,10 +26,14 @@ pub struct Departure {
     pub line_number: String,
     /// For departures: destination; for arrivals: origin
     pub destination: String,
+    /// Destination stop ID (for departures) or origin stop ID (for arrivals)
+    pub destination_id: Option<String>,
     pub planned_time: String,
     pub estimated_time: Option<String>,
     pub delay_minutes: Option<i32>,
     pub platform: Option<String>,
+    /// Unique trip identifier (AVMSTripID) - consistent across all stops for a journey
+    pub trip_id: Option<String>,
 }
 
 // Keep backward compatibility with old field names
@@ -692,13 +696,29 @@ impl SyncManager {
             return;
         }
 
-        let ifopts: Vec<String> = stop_ifopts.into_iter().map(|(ifopt,)| ifopt).collect();
-        info!(count = ifopts.len(), "Fetching departures and arrivals for stops");
+        // Extract station-level IFOPTs (first 3 parts: de:09761:691)
+        // EFA API works better with station-level IFOPTs and returns platform-level IFOPTs in response
+        let station_ifopts: Vec<String> = stop_ifopts
+            .into_iter()
+            .map(|(ifopt,)| {
+                // Take first 3 parts of IFOPT (de:XXXXX:NNN) to get station level
+                let parts: Vec<&str> = ifopt.split(':').collect();
+                if parts.len() >= 3 {
+                    format!("{}:{}:{}", parts[0], parts[1], parts[2])
+                } else {
+                    ifopt
+                }
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        info!(count = station_ifopts.len(), "Fetching departures and arrivals for stations");
 
         // Fetch departures and arrivals concurrently
         let (departure_results, arrival_results) = tokio::join!(
-            self.efa_client.get_departures_batch(&ifopts, 10, true),
-            self.efa_client.get_arrivals_batch(&ifopts, 10, true)
+            self.efa_client.get_departures_batch(&station_ifopts, 10, true),
+            self.efa_client.get_arrivals_batch(&station_ifopts, 10, true)
         );
 
         let mut success_count = 0;
@@ -709,42 +729,91 @@ impl SyncManager {
         // This preserves existing data for stops that failed and avoids full HashMap replacement
         let mut store = self.departures.write().await;
 
-        // Process departures
-        for (ifopt, result) in departure_results {
+        // Track which platform IFOPTs we've updated for departures/arrivals
+        let mut updated_departure_platforms: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut updated_arrival_platforms: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Process departures - group by actual platform IFOPT from the response
+        for (station_ifopt, result) in departure_results {
             match result {
                 Ok(response) => {
                     let departures =
-                        self.parse_stop_events(&ifopt, &response.stop_events, now, EventType::Departure);
-                    // Get or create the entry for this stop
-                    let entry = store.entry(ifopt.clone()).or_insert_with(Vec::new);
-                    // Remove old departures and add new ones
-                    entry.retain(|d| d.event_type != EventType::Departure);
-                    entry.extend(departures);
+                        self.parse_stop_events(&station_ifopt, &response.stop_events, now, EventType::Departure);
+
+                    // Group departures by their actual platform IFOPT
+                    for departure in departures {
+                        let platform_ifopt = departure.stop_ifopt.clone();
+                        updated_departure_platforms.insert(platform_ifopt.clone());
+                        let entry = store.entry(platform_ifopt).or_insert_with(Vec::new);
+                        entry.push(departure);
+                    }
                     success_count += 1;
                 }
                 Err(e) => {
-                    tracing::debug!(stop = %ifopt, error = %e, "Failed to fetch departures, keeping existing data");
+                    tracing::debug!(station = %station_ifopt, error = %e, "Failed to fetch departures, keeping existing data");
                     error_count += 1;
                 }
             }
         }
 
-        // Process arrivals
-        for (ifopt, result) in arrival_results {
+        // Remove old departures for platforms we updated
+        for platform_ifopt in &updated_departure_platforms {
+            if let Some(entry) = store.get_mut(platform_ifopt) {
+                // Keep only arrivals and newly added departures (added in this sync)
+                let new_departures: Vec<_> = entry.iter()
+                    .filter(|d| d.event_type == EventType::Departure)
+                    .cloned()
+                    .collect();
+                entry.retain(|d| d.event_type != EventType::Departure);
+                // Deduplicate by keeping unique (line_number, planned_time) combinations
+                let mut seen = std::collections::HashSet::new();
+                for dep in new_departures {
+                    let key = (dep.line_number.clone(), dep.planned_time.clone());
+                    if seen.insert(key) {
+                        entry.push(dep);
+                    }
+                }
+            }
+        }
+
+        // Process arrivals - group by actual platform IFOPT from the response
+        for (station_ifopt, result) in arrival_results {
             match result {
                 Ok(response) => {
                     let arrivals =
-                        self.parse_stop_events(&ifopt, &response.stop_events, now, EventType::Arrival);
-                    // Get or create the entry for this stop
-                    let entry = store.entry(ifopt.clone()).or_insert_with(Vec::new);
-                    // Remove old arrivals and add new ones
-                    entry.retain(|d| d.event_type != EventType::Arrival);
-                    entry.extend(arrivals);
+                        self.parse_stop_events(&station_ifopt, &response.stop_events, now, EventType::Arrival);
+
+                    // Group arrivals by their actual platform IFOPT
+                    for arrival in arrivals {
+                        let platform_ifopt = arrival.stop_ifopt.clone();
+                        updated_arrival_platforms.insert(platform_ifopt.clone());
+                        let entry = store.entry(platform_ifopt).or_insert_with(Vec::new);
+                        entry.push(arrival);
+                    }
                     success_count += 1;
                 }
                 Err(e) => {
-                    tracing::debug!(stop = %ifopt, error = %e, "Failed to fetch arrivals, keeping existing data");
+                    tracing::debug!(station = %station_ifopt, error = %e, "Failed to fetch arrivals, keeping existing data");
                     error_count += 1;
+                }
+            }
+        }
+
+        // Remove old arrivals for platforms we updated
+        for platform_ifopt in &updated_arrival_platforms {
+            if let Some(entry) = store.get_mut(platform_ifopt) {
+                let new_arrivals: Vec<_> = entry.iter()
+                    .filter(|d| d.event_type == EventType::Arrival)
+                    .cloned()
+                    .collect();
+                entry.retain(|d| d.event_type != EventType::Arrival);
+                // Deduplicate by keeping unique (line_number, planned_time) combinations
+                let mut seen = std::collections::HashSet::new();
+                for arr in new_arrivals {
+                    let key = (arr.line_number.clone(), arr.planned_time.clone());
+                    if seen.insert(key) {
+                        entry.push(arr);
+                    }
                 }
             }
         }
@@ -768,9 +837,10 @@ impl SyncManager {
     }
 
     /// Parse stop events into Departure structs
+    /// Returns departures keyed by their actual platform IFOPT from the EFA response
     fn parse_stop_events(
         &self,
-        stop_ifopt: &str,
+        _station_ifopt: &str, // Station IFOPT we queried (kept for logging)
         stop_events: &[crate::providers::efa::StopEvent],
         now: DateTime<Utc>,
         event_type: EventType,
@@ -778,6 +848,11 @@ impl SyncManager {
         let mut events = Vec::new();
 
         for event in stop_events {
+            // Use the actual platform IFOPT from the event location
+            let stop_ifopt = match event.location_ifopt() {
+                Some(id) => id,
+                None => continue, // Skip events without location ID
+            };
             let line_number = match event.line_number() {
                 Some(n) => n.to_string(),
                 None => continue,
@@ -839,15 +914,23 @@ impl SyncManager {
                 _ => None,
             };
 
+            // Get destination/origin ID based on event type
+            let destination_id = match event_type {
+                EventType::Departure => event.destination_id().map(|s| s.to_string()),
+                EventType::Arrival => event.origin_id().map(|s| s.to_string()),
+            };
+
             events.push(Departure {
                 stop_ifopt: stop_ifopt.to_string(),
                 event_type,
                 line_number,
                 destination,
+                destination_id,
                 planned_time: planned,
                 estimated_time: estimated,
                 delay_minutes,
                 platform,
+                trip_id: event.trip_id().map(|s| s.to_string()),
             });
         }
 

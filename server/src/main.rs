@@ -33,6 +33,7 @@ use sync::SyncManager;
         api::stations::list::list_stations,
         api::departures::list_departures,
         api::departures::get_departures_by_stop,
+        api::vehicles::get_vehicles_by_route,
     ),
     components(schemas(
         api::areas::list::Area,
@@ -51,6 +52,10 @@ use sync::SyncManager;
         api::departures::DepartureListResponse,
         api::departures::StopDeparturesRequest,
         api::departures::StopDeparturesResponse,
+        api::vehicles::VehiclesByRouteRequest,
+        api::vehicles::VehiclesByRouteResponse,
+        api::vehicles::Vehicle,
+        api::vehicles::VehicleStop,
         sync::Departure,
         sync::EventType,
     )),
@@ -58,7 +63,8 @@ use sync::SyncManager;
         (name = "areas", description = "Area management endpoints"),
         (name = "routes", description = "Route endpoints"),
         (name = "stations", description = "Station and platform endpoints"),
-        (name = "departures", description = "Real-time departure information")
+        (name = "departures", description = "Real-time departure information"),
+        (name = "vehicles", description = "Live vehicle tracking")
     )
 )]
 struct ApiDoc;

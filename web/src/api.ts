@@ -49,6 +49,8 @@ export interface Departure {
   delay_minutes?: number | null;
   /** For departures: destination; for arrivals: origin */
   destination: string;
+  /** Destination stop ID (for departures) or origin stop ID (for arrivals) */
+  destination_id?: string | null;
   estimated_time?: string | null;
   /** Type of stop event */
   event_type: EventType;
@@ -56,6 +58,8 @@ export interface Departure {
   planned_time: string;
   platform?: string | null;
   stop_ifopt: string;
+  /** Unique trip identifier (AVMSTripID) - consistent across all stops for a journey */
+  trip_id?: string | null;
 }
 
 export interface DepartureListResponse {
@@ -168,6 +172,69 @@ export interface StopDeparturesRequest {
 export interface StopDeparturesResponse {
   departures: Departure[];
   stop_ifopt: string;
+}
+
+export interface Vehicle {
+  /** Final destination of this vehicle */
+  destination: string;
+  /** Line number (e.g., "1", "2", "3") */
+  line_number: string;
+  /** Origin of this vehicle's journey */
+  origin?: string | null;
+  /** All stops this vehicle will visit, in order */
+  stops: VehicleStop[];
+  /** Unique trip identifier (AVMSTripID from EFA) */
+  trip_id: string;
+}
+
+export interface VehicleStop {
+  /** Arrival time at this stop (ISO 8601) */
+  arrival_time?: string | null;
+  /** Estimated arrival time (real-time, if available) */
+  arrival_time_estimated?: string | null;
+  /**
+   * Delay in minutes (positive = late, negative = early)
+   * @format int32
+   */
+  delay_minutes?: number | null;
+  /** Departure time from this stop (ISO 8601) */
+  departure_time?: string | null;
+  /** Estimated departure time (real-time, if available) */
+  departure_time_estimated?: string | null;
+  /**
+   * Latitude
+   * @format double
+   */
+  lat: number;
+  /**
+   * Longitude
+   * @format double
+   */
+  lon: number;
+  /**
+   * Sequence number on the route
+   * @format int64
+   */
+  sequence: number;
+  /** Stop IFOPT identifier */
+  stop_ifopt: string;
+  /** Stop name (if available) */
+  stop_name?: string | null;
+}
+
+export interface VehiclesByRouteRequest {
+  /**
+   * The OSM route ID to get vehicles for
+   * @format int64
+   */
+  route_id: number;
+}
+
+export interface VehiclesByRouteResponse {
+  line_number?: string | null;
+  /** @format int64 */
+  route_id: number;
+  vehicles: Vehicle[];
 }
 
 export type QueryParamsType = Record<string | number, any>;
@@ -551,6 +618,24 @@ export class Api<SecurityDataType extends unknown> extends HttpClient<SecurityDa
         path: `/api/stations`,
         method: "GET",
         query: query,
+        format: "json",
+        ...params,
+      }),
+
+    /**
+     * No description
+     *
+     * @tags vehicles
+     * @name GetVehiclesByRoute
+     * @summary Get all vehicles currently on a route with their stop sequences
+     * @request POST:/api/vehicles/by-route
+     */
+    getVehiclesByRoute: (data: VehiclesByRouteRequest, params: RequestParams = {}) =>
+      this.request<VehiclesByRouteResponse, ErrorResponse>({
+        path: `/api/vehicles/by-route`,
+        method: "POST",
+        body: data,
+        type: ContentType.Json,
         format: "json",
         ...params,
       }),

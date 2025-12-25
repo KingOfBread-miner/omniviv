@@ -1,0 +1,12 @@
+services:
+    martin:
+        image: ghcr.io/maplibre/martin
+        volumes:
+            - ./data/maptiles:/mbtiles:ro
+            - ./data/fonts:/fonts:ro
+        command: /mbtiles --font /fonts
+        environment:
+            - RUST_LOG=info
+        restart: unless-stopped
+        ports:
+            - "8080:3000"

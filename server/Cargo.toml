@@ -12,7 +12,7 @@ dev-tools = ["dep:axum-sql-viewer", "dep:tracing-web-console"]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
 # API documentation
 utoipa = { version = "5", features = ["axum_extras"] }

@@ -1,32 +1,84 @@
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { Area, Station, StationPlatform, StationStopPosition } from "../api";
-import type { RouteWithGeometry } from "../App";
+import type { RouteVehicles, RouteWithGeometry } from "../App";
 import { getPlatformDisplayName } from "./mapUtils";
 import { PlatformPopup } from "./PlatformPopup";
 import { StationPopup } from "./StationPopup";
+import { VehiclePopup } from "./VehiclePopup";
+import { calculateVehiclePosition, type VehiclePosition } from "./vehicleUtils";
 
 // Use environment variable or fallback to localhost for development
-const MAP_STYLE_URL = import.meta.env.VITE_MAP_STYLE_URL ?? "http://localhost:8080/styles/basic-preview/style.json";
+const MAP_STYLE_URL = import.meta.env.VITE_MAP_STYLE_URL ?? "/styles/basic-preview/style.json";
+
+// Animation frame rate (how often to recalculate positions in ms)
+// 50ms = 20fps, good balance of smoothness and performance
+const ANIMATION_INTERVAL = 50;
+
+// Vehicle marker icon settings - using high resolution for crisp rendering
+const ICON_SIZE = 48; // Base size in pixels (will be scaled down by icon-size)
+const ICON_SCALE = 0.5; // Scale factor for display
+
+/**
+ * Generate a circle icon with line number for a vehicle marker
+ */
+function createVehicleIcon(color: string, lineNumber: string): ImageData {
+    const size = ICON_SIZE;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d")!;
+
+    const center = size / 2;
+    const radius = size / 2 - 5;
+
+    // Draw white stroke/border
+    ctx.beginPath();
+    ctx.arc(center, center, radius + 3, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+
+    // Draw colored circle
+    ctx.beginPath();
+    ctx.arc(center, center, radius, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+
+    // Draw line number text
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `bold ${size * 0.45}px "Open Sans", sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(lineNumber, center, center + 1);
+
+    return ctx.getImageData(0, 0, size, size);
+}
 
 interface MapProps {
     areas: Area[];
     stations: Station[];
     routes: RouteWithGeometry[];
+    vehicles: RouteVehicles[];
     showAreaOutlines: boolean;
     showStations: boolean;
     showRoutes: boolean;
+    showVehicles: boolean;
 }
 
-export default function Map({ areas, stations, routes, showAreaOutlines, showStations, showRoutes }: MapProps) {
+export default function Map({ areas, stations, routes, vehicles, showAreaOutlines, showStations, showRoutes, showVehicles }: MapProps) {
     const mapContainer = useRef<HTMLDivElement>(null);
     const map = useRef<maplibregl.Map | null>(null);
     const popup = useRef<maplibregl.Popup | null>(null);
     const popupRoot = useRef<Root | null>(null);
     const stationsRef = useRef<Station[]>(stations);
     const routeColorsRef = useRef<globalThis.Map<string, string>>(new globalThis.Map());
+    const routeGeometriesRef = useRef<globalThis.Map<number, number[][][]>>(new globalThis.Map());
+    const vehiclesRef = useRef<RouteVehicles[]>(vehicles);
+    const animationRef = useRef<number | null>(null);
+    const lastAnimationTimeRef = useRef<number>(0);
+    const vehicleIconsRef = useRef<Set<string>>(new Set());
     const [mapLoaded, setMapLoaded] = useState(false);
 
     // Keep stationsRef in sync with stations prop
@@ -34,15 +86,25 @@ export default function Map({ areas, stations, routes, showAreaOutlines, showSta
         stationsRef.current = stations;
     }, [stations]);
 
-    // Build route colors map from routes
+    // Keep vehiclesRef in sync with vehicles prop
+    useEffect(() => {
+        vehiclesRef.current = vehicles;
+    }, [vehicles]);
+
+    // Build route colors map and geometries map from routes
     useEffect(() => {
         const colorMap = new globalThis.Map<string, string>();
+        const geometryMap = new globalThis.Map<number, number[][][]>();
         for (const route of routes) {
             if (route.ref && route.color) {
                 colorMap.set(route.ref, route.color);
             }
+            if (route.geometry?.segments) {
+                geometryMap.set(route.osm_id, route.geometry.segments);
+            }
         }
         routeColorsRef.current = colorMap;
+        routeGeometriesRef.current = geometryMap;
     }, [routes]);
 
     // Helper to show a React component in a popup
@@ -360,21 +422,201 @@ export default function Map({ areas, stations, routes, showAreaOutlines, showSta
                 }
             });
 
+            // Add vehicles source
+            map.current.addSource("vehicles", {
+                type: "geojson",
+                data: { type: "FeatureCollection", features: [] },
+            });
+
+            // Add vehicle markers as a single symbol layer with generated icons
+            map.current.addLayer({
+                id: "vehicles-marker",
+                type: "symbol",
+                source: "vehicles",
+                layout: {
+                    "icon-image": ["get", "iconId"],
+                    "icon-size": ICON_SCALE,
+                    "icon-allow-overlap": true,
+                    "icon-ignore-placement": true,
+                },
+            });
+
+            // Add hover cursor for vehicles
+            map.current.on("mouseenter", "vehicles-marker", () => {
+                if (map.current) map.current.getCanvas().style.cursor = "pointer";
+            });
+
+            map.current.on("mouseleave", "vehicles-marker", () => {
+                if (map.current) map.current.getCanvas().style.cursor = "";
+            });
+
+            // Add click popup for vehicles
+            map.current.on("click", "vehicles-marker", (e) => {
+                if (!e.features || e.features.length === 0) return;
+
+                const feature = e.features[0];
+                const coordinates = (feature.geometry as GeoJSON.Point).coordinates.slice() as [number, number];
+                const tripId = feature.properties?.tripId;
+                const lineNumber = feature.properties?.lineNumber;
+                const destination = feature.properties?.destination;
+                const status = feature.properties?.status;
+                const delayMinutes = feature.properties?.delayMinutes;
+                const currentStopName = feature.properties?.currentStopName;
+                const nextStopName = feature.properties?.nextStopName;
+
+                showPopup(
+                    coordinates,
+                    <VehiclePopup
+                        tripId={tripId}
+                        lineNumber={lineNumber}
+                        destination={destination}
+                        status={status}
+                        delayMinutes={delayMinutes}
+                        currentStopName={currentStopName}
+                        nextStopName={nextStopName}
+                        routeColors={routeColorsRef.current}
+                    />
+                );
+            });
+
             setMapLoaded(true);
         });
 
         return () => {
+            if (animationRef.current) {
+                cancelAnimationFrame(animationRef.current);
+                animationRef.current = null;
+            }
             if (popupRoot.current) {
                 popupRoot.current.unmount();
                 popupRoot.current = null;
             }
             popup.current?.remove();
             popup.current = null;
+            vehicleIconsRef.current.clear();
             // map.remove() cleans up all event listeners, sources, and layers
             map.current?.remove();
             map.current = null;
         };
     }, []); // Empty deps: map should only initialize once
+
+    // Calculate vehicle positions and update the map
+    const updateVehiclePositions = useCallback(() => {
+        if (!map.current || !mapLoaded) return;
+
+        const source = map.current.getSource("vehicles") as maplibregl.GeoJSONSource;
+        if (!source) return;
+
+        const now = new Date();
+
+        // First, deduplicate vehicles by trip_id - keep the one with most stops
+        // This handles cases where the same trip appears on multiple route variants
+        const vehiclesByTripId = new globalThis.Map<string, { vehicle: typeof vehiclesRef.current[0]["vehicles"][0]; routeId: number; stopCount: number }>();
+
+        for (const routeVehicles of vehiclesRef.current) {
+            for (const vehicle of routeVehicles.vehicles) {
+                const existing = vehiclesByTripId.get(vehicle.trip_id);
+                if (!existing || vehicle.stops.length > existing.stopCount) {
+                    vehiclesByTripId.set(vehicle.trip_id, {
+                        vehicle,
+                        routeId: routeVehicles.routeId,
+                        stopCount: vehicle.stops.length,
+                    });
+                }
+            }
+        }
+
+        const features: GeoJSON.Feature[] = [];
+
+        for (const { vehicle, routeId } of vehiclesByTripId.values()) {
+            const routeGeometry = routeGeometriesRef.current.get(routeId);
+            const routeColor = routeColorsRef.current.get(vehicle.line_number ?? "");
+
+            const position = calculateVehiclePosition(
+                vehicle,
+                routeGeometry ?? [],
+                now
+            );
+
+            if (position && position.status !== "completed") {
+                const color = routeColor ?? "#3b82f6";
+                const lineNum = position.lineNumber ?? "?";
+                const iconId = `vehicle-${color.replace("#", "")}-${lineNum}`;
+
+                // Create icon for this color+lineNumber combo if it doesn't exist
+                if (!vehicleIconsRef.current.has(iconId) && map.current) {
+                    const iconData = createVehicleIcon(color, lineNum);
+                    map.current.addImage(iconId, iconData);
+                    vehicleIconsRef.current.add(iconId);
+                }
+
+                features.push({
+                    type: "Feature",
+                    properties: {
+                        tripId: position.tripId,
+                        lineNumber: position.lineNumber,
+                        destination: position.destination,
+                        status: position.status,
+                        delayMinutes: position.delayMinutes,
+                        bearing: position.bearing,
+                        color,
+                        iconId,
+                        currentStopName: position.currentStop?.stop_name ?? null,
+                        nextStopName: position.nextStop?.stop_name ?? null,
+                    },
+                    geometry: {
+                        type: "Point",
+                        coordinates: [position.lon, position.lat],
+                    },
+                });
+            }
+        }
+
+        source.setData({ type: "FeatureCollection", features });
+    }, [mapLoaded]);
+
+    // Animation loop for smooth vehicle movement
+    useEffect(() => {
+        if (!mapLoaded || !showVehicles) {
+            // Clear vehicles when hidden
+            if (map.current && mapLoaded) {
+                const source = map.current.getSource("vehicles") as maplibregl.GeoJSONSource;
+                if (source) {
+                    source.setData({ type: "FeatureCollection", features: [] });
+                }
+            }
+            return;
+        }
+
+        const animate = (timestamp: number) => {
+            // Only update at the specified interval
+            if (timestamp - lastAnimationTimeRef.current >= ANIMATION_INTERVAL) {
+                lastAnimationTimeRef.current = timestamp;
+                updateVehiclePositions();
+            }
+            animationRef.current = requestAnimationFrame(animate);
+        };
+
+        // Initial update
+        updateVehiclePositions();
+
+        // Start animation loop
+        animationRef.current = requestAnimationFrame(animate);
+
+        return () => {
+            if (animationRef.current) {
+                cancelAnimationFrame(animationRef.current);
+                animationRef.current = null;
+            }
+        };
+    }, [mapLoaded, showVehicles, updateVehiclePositions]);
+
+    // Also update when vehicles data changes
+    useEffect(() => {
+        if (mapLoaded && showVehicles) {
+            updateVehiclePositions();
+        }
+    }, [vehicles, mapLoaded, showVehicles, updateVehiclePositions]);
 
     // Update area outlines when areas or visibility changes
     useEffect(() => {

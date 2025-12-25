@@ -223,6 +223,18 @@ pub struct StopEvent {
     pub transportation: Option<Transportation>,
     #[serde(default)]
     pub infos: Vec<Info>,
+    /// Properties containing trip identifiers
+    pub properties: Option<StopEventProperties>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopEventProperties {
+    /// Unique trip identifier consistent across all stops for a journey
+    #[serde(rename = "AVMSTripID")]
+    pub avms_trip_id: Option<String>,
+    /// Trip code (may be null at some stops)
+    #[serde(rename = "tripCode")]
+    pub trip_code: Option<i32>,
 }
 
 impl StopEvent {
@@ -292,6 +304,36 @@ impl StopEvent {
             .properties
             .as_ref()?
             .platform
+            .as_deref()
+    }
+
+    /// Get the unique trip ID (AVMSTripID) that identifies this vehicle journey
+    pub fn trip_id(&self) -> Option<&str> {
+        self.properties.as_ref()?.avms_trip_id.as_deref()
+    }
+
+    /// Get the destination stop ID
+    pub fn destination_id(&self) -> Option<&str> {
+        self.transportation
+            .as_ref()?
+            .destination
+            .as_ref()?
+            .id
+            .as_deref()
+    }
+
+    /// Get the location/platform IFOPT (e.g., "de:09761:691:0:a")
+    pub fn location_ifopt(&self) -> Option<&str> {
+        self.location.as_ref()?.id.as_deref()
+    }
+
+    /// Get the origin stop ID
+    pub fn origin_id(&self) -> Option<&str> {
+        self.transportation
+            .as_ref()?
+            .origin
+            .as_ref()?
+            .id
             .as_deref()
     }
 }

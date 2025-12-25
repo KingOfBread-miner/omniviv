@@ -427,6 +427,57 @@
           }
         }
       }
+    },
+    "/api/vehicles/by-route": {
+      "post": {
+        "tags": [
+          "vehicles"
+        ],
+        "summary": "Get all vehicles currently on a route with their stop sequences",
+        "operationId": "get_vehicles_by_route",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VehiclesByRouteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "List of vehicles on the route",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VehiclesByRouteResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Route not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -549,6 +600,13 @@
             "type": "string",
             "description": "For departures: destination; for arrivals: origin"
           },
+          "destination_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Destination stop ID (for departures) or origin stop ID (for arrivals)"
+          },
           "estimated_time": {
             "type": [
               "string",
@@ -572,6 +630,13 @@
           },
           "stop_ifopt": {
             "type": "string"
+          },
+          "trip_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Unique trip identifier (AVMSTripID) - consistent across all stops for a journey"
           }
         }
       },
@@ -961,6 +1026,154 @@
             "type": "string"
           }
         }
+      },
+      "Vehicle": {
+        "type": "object",
+        "required": [
+          "trip_id",
+          "line_number",
+          "destination",
+          "stops"
+        ],
+        "properties": {
+          "destination": {
+            "type": "string",
+            "description": "Final destination of this vehicle"
+          },
+          "line_number": {
+            "type": "string",
+            "description": "Line number (e.g., \"1\", \"2\", \"3\")"
+          },
+          "origin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Origin of this vehicle's journey"
+          },
+          "stops": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VehicleStop"
+            },
+            "description": "All stops this vehicle will visit, in order"
+          },
+          "trip_id": {
+            "type": "string",
+            "description": "Unique trip identifier (AVMSTripID from EFA)"
+          }
+        }
+      },
+      "VehicleStop": {
+        "type": "object",
+        "required": [
+          "stop_ifopt",
+          "sequence",
+          "lat",
+          "lon"
+        ],
+        "properties": {
+          "arrival_time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Arrival time at this stop (ISO 8601)"
+          },
+          "arrival_time_estimated": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Estimated arrival time (real-time, if available)"
+          },
+          "delay_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Delay in minutes (positive = late, negative = early)"
+          },
+          "departure_time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Departure time from this stop (ISO 8601)"
+          },
+          "departure_time_estimated": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Estimated departure time (real-time, if available)"
+          },
+          "lat": {
+            "type": "number",
+            "format": "double",
+            "description": "Latitude"
+          },
+          "lon": {
+            "type": "number",
+            "format": "double",
+            "description": "Longitude"
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sequence number on the route"
+          },
+          "stop_ifopt": {
+            "type": "string",
+            "description": "Stop IFOPT identifier"
+          },
+          "stop_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stop name (if available)"
+          }
+        }
+      },
+      "VehiclesByRouteRequest": {
+        "type": "object",
+        "required": [
+          "route_id"
+        ],
+        "properties": {
+          "route_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The OSM route ID to get vehicles for"
+          }
+        }
+      },
+      "VehiclesByRouteResponse": {
+        "type": "object",
+        "required": [
+          "route_id",
+          "vehicles"
+        ],
+        "properties": {
+          "line_number": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "route_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "vehicles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Vehicle"
+            }
+          }
+        }
       }
     }
   },
@@ -980,6 +1193,10 @@
     {
       "name": "departures",
       "description": "Real-time departure information"
+    },
+    {
+      "name": "vehicles",
+      "description": "Live vehicle tracking"
     }
   ]
 }
