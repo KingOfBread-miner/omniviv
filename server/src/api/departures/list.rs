@@ -1,9 +1,26 @@
 use axum::{extract::State, Json};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::ErrorResponse;
 use crate::sync::{Departure, DepartureStore};
+
+/// Filter out departures that are in the past
+fn filter_past_departures(departures: Vec<Departure>) -> Vec<Departure> {
+    let now = Utc::now();
+    departures
+        .into_iter()
+        .filter(|d| {
+            // Use estimated time if available, otherwise planned time
+            let time_str = d.estimated_time.as_ref().unwrap_or(&d.planned_time);
+            match chrono::DateTime::parse_from_rfc3339(time_str) {
+                Ok(time) => time > now,
+                Err(_) => true, // Keep if we can't parse the time
+            }
+        })
+        .collect()
+}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DepartureListResponse {
@@ -36,6 +53,7 @@ pub async fn list_departures(
 ) -> Json<DepartureListResponse> {
     let store = store.read().await;
     let departures: Vec<Departure> = store.values().flatten().cloned().collect();
+    let departures = filter_past_departures(departures);
     Json(DepartureListResponse { departures })
 }
 
@@ -56,6 +74,7 @@ pub async fn get_departures_by_stop(
 ) -> Json<StopDeparturesResponse> {
     let store = store.read().await;
     let departures = store.get(&request.stop_ifopt).cloned().unwrap_or_default();
+    let departures = filter_past_departures(departures);
 
     Json(StopDeparturesResponse {
         stop_ifopt: request.stop_ifopt,
