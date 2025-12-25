@@ -533,12 +533,14 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
             }
         }
 
-        const features: GeoJSON.Feature[] = [];
-        const activeTripIds = new Set<string>();
+        // First pass: calculate all positions and track completing vehicles at each location
+        const allPositions: { position: VehiclePosition; routeId: number; routeColor: string; vehicle: typeof vehiclesRef.current[0]["vehicles"][0] }[] = [];
+        // Map of "lineNumber:stopIfopt" -> true for locations where a vehicle is completing
+        const completingAtLocation = new Set<string>();
 
         for (const { vehicle, routeId } of vehiclesByTripId.values()) {
             const routeGeometry = routeGeometriesRef.current.get(routeId);
-            const routeColor = routeColorsRef.current.get(vehicle.line_number ?? "");
+            const routeColor = routeColorsRef.current.get(vehicle.line_number ?? "") ?? "#3b82f6";
 
             const targetPosition = calculateVehiclePosition(
                 vehicle,
@@ -547,50 +549,76 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
             );
 
             if (targetPosition && targetPosition.status !== "completed") {
-                activeTripIds.add(targetPosition.tripId);
+                allPositions.push({ position: targetPosition, routeId, routeColor, vehicle });
 
-                // Get or create smoothed position for this vehicle
-                let smoothedPosition = smoothedPositionsRef.current.get(targetPosition.tripId);
-                if (smoothedPosition) {
-                    // Update existing smoothed position toward target
-                    smoothedPosition = updateSmoothedPosition(smoothedPosition, targetPosition, deltaMs);
-                } else {
-                    // Create new smoothed position starting at target
-                    smoothedPosition = createSmoothedPosition(targetPosition);
+                // Track if this vehicle is approaching its final stop (on last segment)
+                const lastStop = vehicle.stops[vehicle.stops.length - 1];
+                const isOnFinalSegment = targetPosition.nextStop?.stop_ifopt === lastStop?.stop_ifopt;
+
+                // Show waiting vehicle when another vehicle is on final segment with >50% progress
+                if (isOnFinalSegment && targetPosition.progress > 0.5 && lastStop?.stop_ifopt) {
+                    completingAtLocation.add(`${targetPosition.lineNumber}:${lastStop.stop_ifopt}`);
                 }
-                smoothedPositionsRef.current.set(targetPosition.tripId, smoothedPosition);
-
-                const color = routeColor ?? "#3b82f6";
-                const lineNum = smoothedPosition.lineNumber ?? "?";
-                const iconId = `vehicle-${color.replace("#", "")}-${lineNum}`;
-
-                // Create icon for this color+lineNumber combo if it doesn't exist
-                if (!vehicleIconsRef.current.has(iconId) && map.current) {
-                    const iconData = createVehicleIcon(color, lineNum);
-                    map.current.addImage(iconId, iconData);
-                    vehicleIconsRef.current.add(iconId);
-                }
-
-                features.push({
-                    type: "Feature",
-                    properties: {
-                        tripId: smoothedPosition.tripId,
-                        lineNumber: smoothedPosition.lineNumber,
-                        destination: smoothedPosition.destination,
-                        status: smoothedPosition.status,
-                        delayMinutes: smoothedPosition.delayMinutes,
-                        bearing: smoothedPosition.renderedBearing,
-                        color,
-                        iconId,
-                        currentStopName: smoothedPosition.currentStop?.stop_name ?? null,
-                        nextStopName: smoothedPosition.nextStop?.stop_name ?? null,
-                    },
-                    geometry: {
-                        type: "Point",
-                        coordinates: [smoothedPosition.renderedLon, smoothedPosition.renderedLat],
-                    },
-                });
             }
+        }
+
+        const features: GeoJSON.Feature[] = [];
+        const activeTripIds = new Set<string>();
+
+        // Second pass: create features, filtering out waiting vehicles without a completing vehicle at the same stop
+        for (const { position: targetPosition, routeColor, vehicle } of allPositions) {
+            // Skip waiting vehicles unless there's a completing/completed vehicle at this same location
+            if (targetPosition.status === "waiting") {
+                const firstStop = vehicle.stops[0];
+                const locationKey = `${targetPosition.lineNumber}:${firstStop?.stop_ifopt}`;
+                if (!completingAtLocation.has(locationKey)) {
+                    continue;
+                }
+            }
+
+            activeTripIds.add(targetPosition.tripId);
+
+            // Get or create smoothed position for this vehicle
+            let smoothedPosition = smoothedPositionsRef.current.get(targetPosition.tripId);
+            if (smoothedPosition) {
+                // Update existing smoothed position toward target
+                smoothedPosition = updateSmoothedPosition(smoothedPosition, targetPosition, deltaMs);
+            } else {
+                // Create new smoothed position starting at target
+                smoothedPosition = createSmoothedPosition(targetPosition);
+            }
+            smoothedPositionsRef.current.set(targetPosition.tripId, smoothedPosition);
+
+            const color = routeColor;
+            const lineNum = smoothedPosition.lineNumber ?? "?";
+            const iconId = `vehicle-${color.replace("#", "")}-${lineNum}`;
+
+            // Create icon for this color+lineNumber combo if it doesn't exist
+            if (!vehicleIconsRef.current.has(iconId) && map.current) {
+                const iconData = createVehicleIcon(color, lineNum);
+                map.current.addImage(iconId, iconData);
+                vehicleIconsRef.current.add(iconId);
+            }
+
+            features.push({
+                type: "Feature",
+                properties: {
+                    tripId: smoothedPosition.tripId,
+                    lineNumber: smoothedPosition.lineNumber,
+                    destination: smoothedPosition.destination,
+                    status: smoothedPosition.status,
+                    delayMinutes: smoothedPosition.delayMinutes,
+                    bearing: smoothedPosition.renderedBearing,
+                    color,
+                    iconId,
+                    currentStopName: smoothedPosition.currentStop?.stop_name ?? null,
+                    nextStopName: smoothedPosition.nextStop?.stop_name ?? null,
+                },
+                geometry: {
+                    type: "Point",
+                    coordinates: [smoothedPosition.renderedLon, smoothedPosition.renderedLat],
+                },
+            });
         }
 
         // Clean up smoothed positions for vehicles that are no longer active
