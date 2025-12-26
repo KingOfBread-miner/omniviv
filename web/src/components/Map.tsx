@@ -88,6 +88,27 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
     const smoothedPositionsRef = useRef<globalThis.Map<string, SmoothedVehiclePosition>>(new globalThis.Map());
     const [mapLoaded, setMapLoaded] = useState(false);
 
+    // Vehicle tracking state
+    const [trackedTripId, setTrackedTripId] = useState<string | null>(null);
+    const [trackingInfo, setTrackingInfo] = useState<{
+        lineNumber: string;
+        destination: string;
+        nextStopName: string | null;
+        progress: number;
+        secondsToNextStop: number | null;
+        status: string;
+        color: string;
+    } | null>(null);
+    const trackedTripIdRef = useRef<string | null>(null);
+
+    // Keep ref in sync with state
+    useEffect(() => {
+        trackedTripIdRef.current = trackedTripId;
+        if (!trackedTripId) {
+            setTrackingInfo(null);
+        }
+    }, [trackedTripId]);
+
     // Keep stationsRef in sync with stations prop
     useEffect(() => {
         stationsRef.current = stations;
@@ -457,33 +478,24 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
                 if (map.current) map.current.getCanvas().style.cursor = "";
             });
 
-            // Add click popup for vehicles
+            // Add click handler for vehicles - toggle tracking
             map.current.on("click", "vehicles-marker", (e) => {
                 if (!e.features || e.features.length === 0) return;
 
                 const feature = e.features[0];
-                const coordinates = (feature.geometry as GeoJSON.Point).coordinates.slice() as [number, number];
                 const tripId = feature.properties?.tripId;
-                const lineNumber = feature.properties?.lineNumber;
-                const destination = feature.properties?.destination;
-                const status = feature.properties?.status;
-                const delayMinutes = feature.properties?.delayMinutes;
-                const currentStopName = feature.properties?.currentStopName;
-                const nextStopName = feature.properties?.nextStopName;
 
-                showPopup(
-                    coordinates,
-                    <VehiclePopup
-                        tripId={tripId}
-                        lineNumber={lineNumber}
-                        destination={destination}
-                        status={status}
-                        delayMinutes={delayMinutes}
-                        currentStopName={currentStopName}
-                        nextStopName={nextStopName}
-                        routeColors={routeColorsRef.current}
-                    />
-                );
+                // Toggle tracking for this vehicle
+                setTrackedTripId((current) => (current === tripId ? null : tripId));
+            });
+
+            // Click on map (not on a vehicle) stops tracking
+            map.current.on("click", (e) => {
+                // Check if click was on a vehicle
+                const features = map.current?.queryRenderedFeatures(e.point, { layers: ["vehicles-marker"] });
+                if (!features || features.length === 0) {
+                    setTrackedTripId(null);
+                }
             });
 
             setMapLoaded(true);
@@ -628,6 +640,13 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
             }
         }
 
+        // Check if tracked vehicle still exists
+        const currentTrackedId = trackedTripIdRef.current;
+        if (currentTrackedId && !smoothedPositionsRef.current.has(currentTrackedId)) {
+            // Tracked vehicle no longer exists, stop tracking
+            setTrackedTripId(null);
+        }
+
         source.setData({ type: "FeatureCollection", features });
     }, [mapLoaded]);
 
@@ -673,6 +692,187 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
             }
         };
     }, [mapLoaded, showVehicles, updateVehiclePositions]);
+
+    // Custom interaction handling when tracking a vehicle
+    useEffect(() => {
+        if (!map.current || !mapLoaded) return;
+        if (!trackedTripId) return;
+
+        const mapInstance = map.current;
+        let trackingAnimationId: number | null = null;
+        let isZoomingIn = false;
+
+        // Zoom in if too far out when starting to track
+        const MIN_TRACKING_ZOOM = 16;
+        if (mapInstance.getZoom() < MIN_TRACKING_ZOOM) {
+            const trackedPosition = smoothedPositionsRef.current.get(trackedTripId);
+            if (trackedPosition) {
+                isZoomingIn = true;
+                mapInstance.flyTo({
+                    center: [trackedPosition.renderedLon, trackedPosition.renderedLat],
+                    zoom: MIN_TRACKING_ZOOM,
+                    duration: 1000,
+                });
+                mapInstance.once("moveend", () => {
+                    isZoomingIn = false;
+                });
+            }
+        }
+
+        // Disable native handlers - we'll handle interactions ourselves
+        mapInstance.dragPan.disable();
+        mapInstance.scrollZoom.disable();
+        mapInstance.dragRotate.disable();
+
+        // Track drag state
+        let isRightDragging = false;
+        let isLeftDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+
+        // Custom wheel handler - zoom around the tracked vehicle
+        const handleWheel = (e: WheelEvent) => {
+            e.preventDefault();
+
+            const trackedPosition = smoothedPositionsRef.current.get(trackedTripId);
+            if (!trackedPosition) return;
+
+            const currentZoom = mapInstance.getZoom();
+            const zoomDelta = -e.deltaY * 0.002;
+            const newZoom = Math.max(10, Math.min(20, currentZoom + zoomDelta));
+
+            mapInstance.setZoom(newZoom);
+        };
+
+        const handleMouseDown = (e: MouseEvent) => {
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+
+            if (e.button === 2) { // Right click for rotation
+                isRightDragging = true;
+                e.preventDefault();
+            } else if (e.button === 0) { // Left click - track for potential drag
+                isLeftDragging = true;
+            }
+        };
+
+        const handleMouseMove = (e: MouseEvent) => {
+            const deltaX = e.clientX - lastMouseX;
+            const deltaY = e.clientY - lastMouseY;
+
+            // Left drag - exit tracking mode and let native pan take over immediately
+            if (isLeftDragging && (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3)) {
+                isLeftDragging = false;
+
+                // Re-enable native handlers immediately
+                mapInstance.dragPan.enable();
+                mapInstance.scrollZoom.enable();
+                mapInstance.dragRotate.enable();
+
+                // Simulate mousedown to start native pan from current position
+                const canvas = mapInstance.getCanvas();
+                const syntheticEvent = new MouseEvent("mousedown", {
+                    clientX: lastMouseX,
+                    clientY: lastMouseY,
+                    button: 0,
+                    bubbles: true,
+                });
+                canvas.dispatchEvent(syntheticEvent);
+
+                // Now stop tracking (cleanup won't re-enable handlers since they're already enabled)
+                setTrackedTripId(null);
+                return;
+            }
+
+            // Right drag - rotate/pitch
+            if (isRightDragging) {
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+
+                const currentBearing = mapInstance.getBearing();
+                const currentPitch = mapInstance.getPitch();
+
+                mapInstance.setBearing(currentBearing + deltaX * 0.5);
+                mapInstance.setPitch(Math.max(0, Math.min(85, currentPitch - deltaY * 0.5)));
+            }
+        };
+
+        const handleMouseUp = () => {
+            isRightDragging = false;
+            isLeftDragging = false;
+        };
+
+        // Prevent context menu on right-click
+        const handleContextMenu = (e: MouseEvent) => {
+            e.preventDefault();
+        };
+
+        // Animation loop to keep camera centered on vehicle
+        const trackVehicle = () => {
+            const trackedPosition = smoothedPositionsRef.current.get(trackedTripId);
+            if (trackedPosition && map.current) {
+                // Update camera (skip during initial zoom animation)
+                if (!isZoomingIn) {
+                    map.current.setCenter([trackedPosition.renderedLon, trackedPosition.renderedLat]);
+                }
+
+                // Calculate seconds to next stop
+                let secondsToNextStop: number | null = null;
+                if (trackedPosition.nextStop) {
+                    const arrivalTimeStr = trackedPosition.nextStop.arrival_time_estimated || trackedPosition.nextStop.arrival_time;
+                    if (arrivalTimeStr) {
+                        const arrivalTime = new Date(arrivalTimeStr).getTime();
+                        const now = Date.now();
+                        secondsToNextStop = Math.max(0, Math.round((arrivalTime - now) / 1000));
+                    }
+                }
+
+                // Get route color
+                const routeColor = routeColorsRef.current.get(trackedPosition.lineNumber) ?? "#3b82f6";
+
+                // Update tracking info
+                setTrackingInfo({
+                    lineNumber: trackedPosition.lineNumber,
+                    destination: trackedPosition.destination,
+                    nextStopName: trackedPosition.nextStop?.stop_name ?? null,
+                    progress: trackedPosition.progress,
+                    secondsToNextStop,
+                    status: trackedPosition.status,
+                    color: routeColor,
+                });
+            }
+            trackingAnimationId = requestAnimationFrame(trackVehicle);
+        };
+
+        // Set up event listeners
+        const canvas = mapInstance.getCanvas();
+        canvas.addEventListener("wheel", handleWheel, { passive: false });
+        canvas.addEventListener("mousedown", handleMouseDown);
+        canvas.addEventListener("contextmenu", handleContextMenu);
+        window.addEventListener("mousemove", handleMouseMove);
+        window.addEventListener("mouseup", handleMouseUp);
+
+        // Start tracking animation
+        trackingAnimationId = requestAnimationFrame(trackVehicle);
+
+        return () => {
+            // Clean up
+            if (trackingAnimationId) {
+                cancelAnimationFrame(trackingAnimationId);
+            }
+
+            canvas.removeEventListener("wheel", handleWheel);
+            canvas.removeEventListener("mousedown", handleMouseDown);
+            canvas.removeEventListener("contextmenu", handleContextMenu);
+            window.removeEventListener("mousemove", handleMouseMove);
+            window.removeEventListener("mouseup", handleMouseUp);
+
+            // Re-enable native handlers
+            mapInstance.dragPan.enable();
+            mapInstance.scrollZoom.enable();
+            mapInstance.dragRotate.enable();
+        };
+    }, [trackedTripId, mapLoaded]);
 
     // Also update when vehicles data changes (new data from backend)
     useEffect(() => {
@@ -844,5 +1044,39 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
         source.setData({ type: "FeatureCollection", features });
     }, [routes, showRoutes, mapLoaded]);
 
-    return <div ref={mapContainer} className="w-full h-full" />;
+    return (
+        <div className="relative w-full h-full">
+            <div ref={mapContainer} className="w-full h-full" />
+            {trackingInfo && (
+                <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-[calc(100%+50px)] pointer-events-none">
+                    <div className="bg-white px-4 py-3 rounded-lg shadow-lg text-sm text-gray-800 min-w-48">
+                        <div className="font-bold text-base mb-1">
+                            {trackingInfo.lineNumber} → {trackingInfo.destination}
+                        </div>
+                        {trackingInfo.nextStopName && (
+                            <div className="text-gray-600">
+                                <span className="font-medium">Next:</span> {trackingInfo.nextStopName}
+                            </div>
+                        )}
+                        <div className="flex items-center gap-2 mt-2">
+                            <div className="flex-1 h-2 bg-gray-200 rounded-full overflow-hidden">
+                                <div
+                                    className="h-full transition-all duration-300"
+                                    style={{
+                                        width: `${Math.round(trackingInfo.progress * 100)}%`,
+                                        backgroundColor: trackingInfo.color,
+                                    }}
+                                />
+                            </div>
+                            {trackingInfo.secondsToNextStop !== null && (
+                                <span className="text-xs text-gray-500 font-mono tabular-nums">
+                                    {`${Math.floor(trackingInfo.secondsToNextStop / 60)}m ${String(trackingInfo.secondsToNextStop % 60).padStart(2, "0")}s`}
+                                </span>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
 }
