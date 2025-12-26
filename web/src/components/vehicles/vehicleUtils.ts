@@ -1,4 +1,4 @@
-import type { Vehicle, VehicleStop } from "../api";
+import type { Vehicle, VehicleStop } from "../../api";
 
 export interface VehiclePosition {
     tripId: string;

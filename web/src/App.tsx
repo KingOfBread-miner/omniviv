@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Api, Area, Route, RouteGeometry, Station, Vehicle } from "./api";
 import { IssuesPanel } from "./components/IssuesPanel";
-import Map from "./components/Map";
+import Map from "./components/map/Map";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 const api = new Api({ baseUrl: API_URL });

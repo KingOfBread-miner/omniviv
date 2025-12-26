@@ -1,7 +1,7 @@
 import { Terminal } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Api, EventType, type Departure, type StationPlatform, type StationStopPosition } from "../api";
-import { formatTime, getPlatformDisplayName } from "./mapUtils";
+import { formatTime, getPlatformDisplayName } from "./map/mapUtils";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 const api = new Api({ baseUrl: API_URL });

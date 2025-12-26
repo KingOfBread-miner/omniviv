@@ -1,13 +1,13 @@
 /**
- * Tram model definitions for 3D visualization
+ * Vehicle model definitions for 3D visualization
  *
- * Each model defines the wagon configuration for a specific tram type.
- * This allows for accurate representation of different tram models
+ * Each model defines the wagon configuration for a specific vehicle type.
+ * This allows for accurate representation of different vehicle models
  * with their unique articulation patterns.
  */
 
-export interface WagonSegment {
-    /** Length of this wagon segment in meters */
+export interface VehicleSegment {
+    /** Length of this segment in meters */
     length: number;
     /** Type of segment for styling purposes */
     type: 'cab' | 'passenger' | 'articulation';
@@ -17,19 +17,19 @@ export interface WagonSegment {
     hasBogies: boolean;
 }
 
-export interface TramModel {
+export interface VehicleModel {
     /** Unique identifier for this model */
     id: string;
     /** Display name */
     name: string;
     /** Manufacturer */
     manufacturer: string;
-    /** Total width of the tram in meters */
+    /** Total width of the vehicle in meters */
     width: number;
     /** Total length in meters (sum of all segments) */
     totalLength: number;
-    /** Wagon segments from front to back */
-    segments: WagonSegment[];
+    /** Segments from front to back */
+    segments: VehicleSegment[];
     /** Gap between segments in meters (for articulation joints) */
     articulationGap: number;
 }
@@ -46,37 +46,30 @@ export interface TramModel {
  *
  * Bogie positions: Front cab, Articulation 1, Articulation 2, Rear cab
  */
-export const siemensCombino: TramModel = {
+export const siemensCombino: VehicleModel = {
     id: 'siemens-combino-augsburg',
     name: 'Combino (Augsburg)',
     manufacturer: 'Siemens',
     width: 2.6,
     totalLength: 42,
-    articulationGap: 0.3, // Small gap at articulation joints
+    articulationGap: 0.3,
     segments: [
-        // Front cab section (L) - has bogies
         { length: 7.2, type: 'cab', height: 3.4, hasBogies: true },
-        // Passenger section (L) - suspended, no bogies
         { length: 6.8, type: 'passenger', height: 3.4, hasBogies: false },
-        // Articulation module (S) - has bogies underneath
         { length: 2.4, type: 'articulation', height: 3.2, hasBogies: true },
-        // Middle passenger section (L) - suspended, no bogies
         { length: 6.8, type: 'passenger', height: 3.4, hasBogies: false },
-        // Articulation module (S) - has bogies underneath
         { length: 2.4, type: 'articulation', height: 3.2, hasBogies: true },
-        // Passenger section (L) - suspended, no bogies
         { length: 6.8, type: 'passenger', height: 3.4, hasBogies: false },
-        // Rear cab section (L) - has bogies
         { length: 7.2, type: 'cab', height: 3.4, hasBogies: true },
     ],
 };
 
 /**
- * Generic tram model for fallback/testing
+ * Generic vehicle model for fallback/testing
  */
-export const genericTram: TramModel = {
+export const genericVehicle: VehicleModel = {
     id: 'generic',
-    name: 'Generic Tram',
+    name: 'Generic Vehicle',
     manufacturer: 'Generic',
     width: 2.4,
     totalLength: 30,
@@ -88,37 +81,34 @@ export const genericTram: TramModel = {
 };
 
 /**
- * Registry of all available tram models
+ * Registry of all available vehicle models
  */
-export const tramModels: Record<string, TramModel> = {
+export const vehicleModels: Record<string, VehicleModel> = {
     'siemens-combino-augsburg': siemensCombino,
-    'generic': genericTram,
+    'generic': genericVehicle,
 };
 
 /**
- * Get a tram model by ID, with fallback to generic
+ * Get a vehicle model by ID, with fallback to generic
  */
-export function getTramModel(modelId: string): TramModel {
-    return tramModels[modelId] ?? genericTram;
+export function getVehicleModel(modelId: string): VehicleModel {
+    return vehicleModels[modelId] ?? genericVehicle;
 }
 
 /**
- * Calculate the distances from the front of the tram to each segment's
+ * Calculate the distances from the front of the vehicle to each segment's
  * front and rear endpoints. Used for track-following visualization.
- *
- * @param model The tram model
- * @returns Array of { frontDistance, rearDistance, segment } for each segment
  */
-export function calculateSegmentDistances(model: TramModel): Array<{
+export function calculateSegmentDistances(model: VehicleModel): Array<{
     frontDistance: number;
     rearDistance: number;
-    segment: WagonSegment;
+    segment: VehicleSegment;
     index: number;
 }> {
     const result: Array<{
         frontDistance: number;
         rearDistance: number;
-        segment: WagonSegment;
+        segment: VehicleSegment;
         index: number;
     }> = [];
     let currentDistance = 0;
@@ -138,13 +128,9 @@ export function calculateSegmentDistances(model: TramModel): Array<{
 }
 
 /**
- * Get all unique distances along the tram that need track positions.
- * This flattens the segment endpoints into a single array of distances.
- *
- * @param model The tram model
- * @returns Array of distances from front of tram
+ * Get all unique distances along the vehicle that need track positions.
  */
-export function getAllTrackDistances(model: TramModel): number[] {
+export function getAllTrackDistances(model: VehicleModel): number[] {
     const distances = new Set<number>();
     let currentDistance = 0;
 
@@ -158,8 +144,8 @@ export function getAllTrackDistances(model: TramModel): number[] {
 }
 
 /**
- * Get the default tram model for Augsburg
+ * Get the default vehicle model for Augsburg
  */
-export function getAugsburgTramModel(): TramModel {
+export function getAugsburgVehicleModel(): VehicleModel {
     return siemensCombino;
 }

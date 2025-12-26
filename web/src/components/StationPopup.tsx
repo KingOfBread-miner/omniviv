@@ -1,6 +1,6 @@
 import { Terminal } from "lucide-react";
 import type { Station, StationPlatform, StationStopPosition } from "../api";
-import { getPlatformDisplayName } from "./mapUtils";
+import { getPlatformDisplayName } from "./map/mapUtils";
 
 interface StationPopupProps {
     station: Station;
