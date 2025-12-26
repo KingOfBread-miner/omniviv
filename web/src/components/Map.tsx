@@ -8,9 +8,11 @@ import { getPlatformDisplayName } from "./mapUtils";
 import { PlatformPopup } from "./PlatformPopup";
 import { StationPopup } from "./StationPopup";
 import { VehiclePopup } from "./VehiclePopup";
+import { calculateSegmentDistances, getAugsburgTramModel, type TramModel } from "./tramModels";
 import {
     calculateVehiclePosition,
     createSmoothedPosition,
+    findPositionsAlongTrack,
     updateSmoothedPosition,
     type SmoothedVehiclePosition,
     type VehiclePosition,
@@ -100,6 +102,11 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
         color: string;
     } | null>(null);
     const trackedTripIdRef = useRef<string | null>(null);
+    const tramCarsSourceAdded = useRef<boolean>(false);
+
+    // Cache for valid tram car positions per vehicle
+    type SegmentPosition = { frontLon: number; frontLat: number; rearLon: number; rearLat: number };
+    const tramCarPositionsRef = useRef<globalThis.Map<string, SegmentPosition[]>>(new globalThis.Map());
 
     // Keep ref in sync with state
     useEffect(() => {
@@ -450,13 +457,34 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
                 }
             });
 
+            // Add tram cars source for 3D visualization (added first so it renders below markers)
+            map.current.addSource("tram-cars", {
+                type: "geojson",
+                data: { type: "FeatureCollection", features: [] },
+            });
+
+            // Add tram cars as 3D extruded boxes
+            map.current.addLayer({
+                id: "tram-cars-3d",
+                type: "fill-extrusion",
+                source: "tram-cars",
+                paint: {
+                    "fill-extrusion-color": ["get", "color"],
+                    "fill-extrusion-height": ["get", "height"], // Use segment-specific height
+                    "fill-extrusion-base": 0.5, // Start 0.5m above ground (on tracks)
+                    "fill-extrusion-opacity": 0.9,
+                },
+            });
+
+            tramCarsSourceAdded.current = true;
+
             // Add vehicles source
             map.current.addSource("vehicles", {
                 type: "geojson",
                 data: { type: "FeatureCollection", features: [] },
             });
 
-            // Add vehicle markers as a single symbol layer with generated icons
+            // Add vehicle markers as a single symbol layer with generated icons (on top of tram cars)
             map.current.addLayer({
                 id: "vehicles-marker",
                 type: "symbol",
@@ -637,6 +665,7 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
         for (const tripId of smoothedPositionsRef.current.keys()) {
             if (!activeTripIds.has(tripId)) {
                 smoothedPositionsRef.current.delete(tripId);
+                tramCarPositionsRef.current.delete(tripId);
             }
         }
 
@@ -648,6 +677,151 @@ export default function Map({ areas, stations, routes, vehicles, showAreaOutline
         }
 
         source.setData({ type: "FeatureCollection", features });
+
+        // Update tram car 3D models for all vehicles
+        if (tramCarsSourceAdded.current) {
+            const tramModel = getAugsburgTramModel();
+            const segmentDistances = calculateSegmentDistances(tramModel);
+            const tramCarFeatures: GeoJSON.Feature[] = [];
+
+            // Helper to calculate distance between two points in meters
+            const distanceMeters = (lon1: number, lat1: number, lon2: number, lat2: number): number => {
+                const R = 6371000;
+                const phi1 = (lat1 * Math.PI) / 180;
+                const phi2 = (lat2 * Math.PI) / 180;
+                const dPhi = ((lat2 - lat1) * Math.PI) / 180;
+                const dLambda = ((lon2 - lon1) * Math.PI) / 180;
+                const a = Math.sin(dPhi / 2) ** 2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dLambda / 2) ** 2;
+                return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            };
+
+            // Helper to create a tram car polygon
+            const createSegmentPolygon = (
+                frontLon: number, frontLat: number,
+                rearLon: number, rearLat: number,
+                width: number
+            ): number[][] => {
+                const metersPerDegreeLat = 111320;
+                const metersPerDegreeLon = 111320 * Math.cos((frontLat * Math.PI) / 180);
+                const dx = (frontLon - rearLon) * metersPerDegreeLon;
+                const dy = (frontLat - rearLat) * metersPerDegreeLat;
+                const length = Math.sqrt(dx * dx + dy * dy);
+                if (length < 0.1) return [];
+                const dirX = dx / length;
+                const dirY = dy / length;
+                const perpX = dirY;
+                const perpY = -dirX;
+                const halfWidth = width / 2;
+                const corners = [
+                    [frontLon + (perpX * halfWidth) / metersPerDegreeLon, frontLat + (perpY * halfWidth) / metersPerDegreeLat],
+                    [frontLon - (perpX * halfWidth) / metersPerDegreeLon, frontLat - (perpY * halfWidth) / metersPerDegreeLat],
+                    [rearLon - (perpX * halfWidth) / metersPerDegreeLon, rearLat - (perpY * halfWidth) / metersPerDegreeLat],
+                    [rearLon + (perpX * halfWidth) / metersPerDegreeLon, rearLat + (perpY * halfWidth) / metersPerDegreeLat],
+                ];
+                corners.push(corners[0]);
+                return corners;
+            };
+
+            for (const { position, routeId, routeColor } of allPositions) {
+                const smoothedPosition = smoothedPositionsRef.current.get(position.tripId);
+                if (!smoothedPosition) continue;
+
+                const routeGeometry = routeGeometriesRef.current.get(routeId) ?? [];
+                const lon = smoothedPosition.renderedLon;
+                const lat = smoothedPosition.renderedLat;
+                const bearing = smoothedPosition.renderedBearing;
+
+                // Collect all segment distances
+                const allDistances: number[] = [];
+                for (const segInfo of segmentDistances) {
+                    allDistances.push(segInfo.frontDistance, segInfo.rearDistance);
+                }
+
+                // Get track positions for all segment endpoints
+                const allTrackPositions = findPositionsAlongTrack(lon, lat, allDistances, bearing, routeGeometry);
+
+                // Calculate new segment positions and validate them
+                const newPositions: SegmentPosition[] = [];
+                let allValid = true;
+                const lastValidPositions = tramCarPositionsRef.current.get(position.tripId) ?? [];
+
+                for (let i = 0; i < segmentDistances.length; i++) {
+                    const segInfo = segmentDistances[i];
+                    const frontPos = allTrackPositions[i * 2];
+                    const rearPos = allTrackPositions[i * 2 + 1];
+
+                    // Validate segment length (should be within 50% of expected)
+                    const actualLength = distanceMeters(frontPos.lon, frontPos.lat, rearPos.lon, rearPos.lat);
+                    const expectedLength = segInfo.segment.length;
+                    const lengthRatio = actualLength / expectedLength;
+
+                    if (lengthRatio < 0.5 || lengthRatio > 1.5) {
+                        allValid = false;
+                        break;
+                    }
+
+                    // Check for teleportation
+                    if (lastValidPositions.length > 0 && lastValidPositions[i]) {
+                        const lastFront = lastValidPositions[i];
+                        const frontMovement = distanceMeters(lastFront.frontLon, lastFront.frontLat, frontPos.lon, frontPos.lat);
+                        if (frontMovement > 20) {
+                            allValid = false;
+                            break;
+                        }
+                    }
+
+                    newPositions.push({
+                        frontLon: frontPos.lon,
+                        frontLat: frontPos.lat,
+                        rearLon: rearPos.lon,
+                        rearLat: rearPos.lat,
+                    });
+                }
+
+                // Use new positions if valid, otherwise keep cached
+                const positionsToUse = (allValid && newPositions.length === segmentDistances.length)
+                    ? newPositions
+                    : lastValidPositions;
+
+                if (allValid && newPositions.length === segmentDistances.length) {
+                    tramCarPositionsRef.current.set(position.tripId, newPositions);
+                }
+
+                // Create polygon features
+                for (let i = 0; i < segmentDistances.length && i < positionsToUse.length; i++) {
+                    const segInfo = segmentDistances[i];
+                    const pos = positionsToUse[i];
+                    if (!pos) continue;
+
+                    const polygon = createSegmentPolygon(
+                        pos.frontLon, pos.frontLat,
+                        pos.rearLon, pos.rearLat,
+                        tramModel.width
+                    );
+
+                    if (polygon.length > 0) {
+                        tramCarFeatures.push({
+                            type: "Feature",
+                            properties: {
+                                color: routeColor,
+                                tripId: position.tripId,
+                                carIndex: segInfo.index,
+                                height: segInfo.segment.height,
+                            },
+                            geometry: {
+                                type: "Polygon",
+                                coordinates: [polygon],
+                            },
+                        });
+                    }
+                }
+            }
+
+            const tramCarsSource = map.current?.getSource("tram-cars") as maplibregl.GeoJSONSource;
+            if (tramCarsSource) {
+                tramCarsSource.setData({ type: "FeatureCollection", features: tramCarFeatures });
+            }
+        }
     }, [mapLoaded]);
 
     // Animation loop for smooth vehicle movement

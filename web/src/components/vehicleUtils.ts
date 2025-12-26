@@ -369,6 +369,223 @@ function calculateBearingCoords(from: number[], to: number[]): number {
 }
 
 /**
+ * Find multiple positions along the track at specific distances from a reference point.
+ * Walks backwards along the route geometry to follow track curves.
+ */
+export function findPositionsAlongTrack(
+    refLon: number,
+    refLat: number,
+    distances: number[],
+    bearing: number,
+    routeGeometry: number[][][]
+): Array<{ lon: number; lat: number; bearing: number }> {
+    // If no geometry, fall back to straight line
+    if (!routeGeometry || routeGeometry.length === 0) {
+        return straightLinePositions(refLon, refLat, distances, bearing);
+    }
+
+    // Flatten route geometry
+    const allCoords: number[][] = [];
+    for (const segment of routeGeometry) {
+        allCoords.push(...segment);
+    }
+
+    if (allCoords.length < 2) {
+        return straightLinePositions(refLon, refLat, distances, bearing);
+    }
+
+    // Find the segment where the vehicle is located (using bearing to pick correct track)
+    const vehicleSegment = findVehicleSegment(allCoords, refLon, refLat, bearing);
+    if (vehicleSegment === null) {
+        return straightLinePositions(refLon, refLat, distances, bearing);
+    }
+
+    // Calculate cumulative distances along track (backwards from vehicle position)
+    // We walk backwards from the vehicle segment
+    const { segmentIndex, t: vehicleT } = vehicleSegment;
+
+    // Build path going backwards from vehicle position
+    const backwardsPath: Array<{ lon: number; lat: number; dist: number }> = [];
+    let cumulativeDist = 0;
+
+    // First point is the vehicle position itself
+    backwardsPath.push({ lon: refLon, lat: refLat, dist: 0 });
+
+    // Add the start of current segment (walking backwards)
+    const segStart = allCoords[segmentIndex];
+    const segEnd = allCoords[segmentIndex + 1];
+    const distToSegStart = haversineDistanceForTrack([refLon, refLat], segStart) ;
+
+    // Only add segment start if we're not already there
+    if (vehicleT > 0.01) {
+        cumulativeDist = distToSegStart;
+        backwardsPath.push({ lon: segStart[0], lat: segStart[1], dist: cumulativeDist });
+    }
+
+    // Continue backwards through previous segments
+    for (let i = segmentIndex - 1; i >= 0; i--) {
+        const prevStart = allCoords[i];
+        const prevEnd = allCoords[i + 1];
+        const segLength = haversineDistanceForTrack(prevStart, prevEnd);
+        cumulativeDist += segLength;
+        backwardsPath.push({ lon: prevStart[0], lat: prevStart[1], dist: cumulativeDist });
+
+        // Stop if we've gone far enough (max tram length ~50m + buffer)
+        if (cumulativeDist > 60) break;
+    }
+
+    // For each requested distance, interpolate position along backwards path
+    return distances.map(targetDist => {
+        if (targetDist === 0) {
+            return { lon: refLon, lat: refLat, bearing };
+        }
+
+        // Find the two path points that bracket this distance
+        for (let i = 0; i < backwardsPath.length - 1; i++) {
+            const p1 = backwardsPath[i];
+            const p2 = backwardsPath[i + 1];
+
+            if (targetDist >= p1.dist && targetDist <= p2.dist) {
+                // Interpolate between p1 and p2
+                const segDist = p2.dist - p1.dist;
+                const t = segDist > 0 ? (targetDist - p1.dist) / segDist : 0;
+
+                const lon = p1.lon + (p2.lon - p1.lon) * t;
+                const lat = p1.lat + (p2.lat - p1.lat) * t;
+                const segBearing = calculateBearingCoords([p2.lon, p2.lat], [p1.lon, p1.lat]);
+
+                return { lon, lat, bearing: segBearing };
+            }
+        }
+
+        // If we've gone past the end of our path, extrapolate from the last segment
+        const lastIdx = backwardsPath.length - 1;
+        if (lastIdx > 0) {
+            const last = backwardsPath[lastIdx];
+            const prev = backwardsPath[lastIdx - 1];
+            const extraDist = targetDist - last.dist;
+            const segBearing = calculateBearingCoords([prev.lon, prev.lat], [last.lon, last.lat]);
+            const behindRad = (segBearing * Math.PI) / 180;
+            const metersPerDegreeLat = 111320;
+            const metersPerDegreeLon = 111320 * Math.cos((last.lat * Math.PI) / 180);
+
+            return {
+                lon: last.lon + (extraDist * Math.sin(behindRad)) / metersPerDegreeLon,
+                lat: last.lat + (extraDist * Math.cos(behindRad)) / metersPerDegreeLat,
+                bearing: segBearing,
+            };
+        }
+
+        // Ultimate fallback
+        return straightLinePositions(refLon, refLat, [targetDist], bearing)[0];
+    });
+}
+
+/**
+ * Find which segment the vehicle is on, using bearing to disambiguate parallel tracks
+ */
+function findVehicleSegment(
+    coords: number[][],
+    refLon: number,
+    refLat: number,
+    vehicleBearing: number
+): { segmentIndex: number; t: number } | null {
+    let best: { segmentIndex: number; t: number; score: number } | null = null;
+
+    for (let i = 0; i < coords.length - 1; i++) {
+        const segBearing = calculateBearingCoords(coords[i], coords[i + 1]);
+
+        // Check bearing match (within 30 degrees)
+        let bearingDiff = Math.abs(segBearing - vehicleBearing);
+        if (bearingDiff > 180) bearingDiff = 360 - bearingDiff;
+        if (bearingDiff > 30) continue;
+
+        // Project point onto segment
+        const projection = projectPointOnSegment(
+            refLon, refLat,
+            coords[i][0], coords[i][1],
+            coords[i + 1][0], coords[i + 1][1]
+        );
+
+        // Score based on distance (lower is better)
+        const score = projection.distance + bearingDiff * 0.5;
+
+        if (!best || score < best.score) {
+            best = { segmentIndex: i, t: projection.t, score };
+        }
+    }
+
+    return best ? { segmentIndex: best.segmentIndex, t: best.t } : null;
+}
+
+/**
+ * Project a point onto a line segment
+ */
+function projectPointOnSegment(
+    px: number, py: number,
+    x1: number, y1: number,
+    x2: number, y2: number
+): { t: number; distance: number } {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lengthSq = dx * dx + dy * dy;
+
+    if (lengthSq === 0) {
+        return { t: 0, distance: haversineDistanceForTrack([px, py], [x1, y1]) };
+    }
+
+    let t = ((px - x1) * dx + (py - y1) * dy) / lengthSq;
+    t = Math.max(0, Math.min(1, t));
+
+    const projLon = x1 + t * dx;
+    const projLat = y1 + t * dy;
+    const distance = haversineDistanceForTrack([px, py], [projLon, projLat]);
+
+    return { t, distance };
+}
+
+/**
+ * Calculate straight line positions (fallback)
+ */
+function straightLinePositions(
+    refLon: number,
+    refLat: number,
+    distances: number[],
+    bearing: number
+): Array<{ lon: number; lat: number; bearing: number }> {
+    const behindRad = ((bearing + 180) * Math.PI) / 180;
+    const metersPerDegreeLat = 111320;
+    const metersPerDegreeLon = 111320 * Math.cos((refLat * Math.PI) / 180);
+
+    return distances.map(dist => {
+        if (dist === 0) {
+            return { lon: refLon, lat: refLat, bearing };
+        }
+        return {
+            lon: refLon + (dist * Math.sin(behindRad)) / metersPerDegreeLon,
+            lat: refLat + (dist * Math.cos(behindRad)) / metersPerDegreeLat,
+            bearing,
+        };
+    });
+}
+
+/**
+ * Haversine distance for track calculations
+ */
+function haversineDistanceForTrack(coord1: number[], coord2: number[]): number {
+    const R = 6371000;
+    const lat1 = (coord1[1] * Math.PI) / 180;
+    const lat2 = (coord2[1] * Math.PI) / 180;
+    const dLat = ((coord2[1] - coord1[1]) * Math.PI) / 180;
+    const dLon = ((coord2[0] - coord1[0]) * Math.PI) / 180;
+
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+    return R * c;
+}
+
+/**
  * Apply easing for smooth acceleration/deceleration near stops
  */
 export function easeInOutProgress(progress: number): number {
