@@ -49,24 +49,52 @@ export class MapLayerManager {
         this.map.addSource("platform-connections", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
         this.map.addLayer({ id: "platform-connections-line", type: "line", source: "platform-connections", paint: { "line-color": "#888", "line-width": 1, "line-opacity": 0.5 } });
 
-        // Platforms
+        // Platforms (grey circles)
         this.map.addSource("platforms", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
         this.map.addLayer({ id: "platforms-circle", type: "circle", source: "platforms", paint: { "circle-radius": 5, "circle-color": "#666", "circle-stroke-width": 1, "circle-stroke-color": "#ffffff" } });
         this.map.addLayer({ id: "platforms-label", type: "symbol", source: "platforms", minzoom: 16, layout: { "text-field": ["get", "name"], "text-font": ["Open Sans Regular"], "text-size": 10, "text-offset": [0, 0.9], "text-anchor": "top" }, paint: { "text-color": "#333", "text-halo-color": "#ffffff", "text-halo-width": 1.5 } });
+
+        // Stop positions (blue squares) - additional layer
+        this.map.addSource("stop-positions", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+        this.map.addLayer({ id: "stop-positions-marker", type: "circle", source: "stop-positions", paint: { "circle-radius": 4, "circle-color": "#3b82f6", "circle-stroke-width": 1, "circle-stroke-color": "#ffffff" } });
+
+        // Platform elements (orange squares) - additional layer
+        this.map.addSource("platform-elements", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+        this.map.addLayer({ id: "platform-elements-marker", type: "circle", source: "platform-elements", paint: { "circle-radius": 4, "circle-color": "#f97316", "circle-stroke-width": 1, "circle-stroke-color": "#ffffff" } });
 
         // Stations
         this.map.addSource("stations", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
         this.map.addLayer({ id: "stations-circle", type: "circle", source: "stations", paint: { "circle-radius": 6, "circle-color": "#525252", "circle-stroke-width": 1.5, "circle-stroke-color": "#ffffff" } });
         this.map.addLayer({ id: "stations-label", type: "symbol", source: "stations", layout: { "text-field": ["get", "name"], "text-font": ["Open Sans Regular"], "text-size": 12, "text-offset": [0, 1.5], "text-anchor": "top" }, paint: { "text-color": "#065f46", "text-halo-color": "#ffffff", "text-halo-width": 2 } });
 
+        // Debug: route segments visualization (ahead=green, behind=red) - added before 3D models so it renders underneath
+        this.map.addSource("debug-segments", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+        this.map.addLayer({
+            id: "debug-segments-line",
+            type: "line",
+            source: "debug-segments",
+            paint: {
+                "line-color": ["get", "color"],
+                "line-width": 8,
+                "line-opacity": 0.7,
+            },
+            layout: { "line-cap": "round", "line-join": "round" },
+        });
+
         // Vehicle 3D models (added before markers so markers render on top)
         this.map.addSource("vehicle-models", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
         this.map.addLayer({ id: "vehicle-models-3d", type: "fill-extrusion", source: "vehicle-models", paint: { "fill-extrusion-color": ["get", "color"], "fill-extrusion-height": ["get", "height"], "fill-extrusion-base": 0.5, "fill-extrusion-opacity": 0.9 } });
         this.vehicleModelsSourceAdded = true;
 
+        // Move vehicle models layer to render on top of 3D buildings from the base style
+        this.map.moveLayer("vehicle-models-3d");
+
         // Vehicles
         this.map.addSource("vehicles", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
         this.map.addLayer({ id: "vehicles-marker", type: "symbol", source: "vehicles", layout: { "icon-image": ["get", "iconId"], "icon-size": VEHICLE_ICON_SCALE, "icon-allow-overlap": true, "icon-ignore-placement": true } });
+
+        // Move debug segments below vehicle models but above buildings
+        this.map.moveLayer("debug-segments-line", "vehicle-models-3d");
     }
 
     /**
@@ -102,16 +130,20 @@ export class MapLayerManager {
     /**
      * Update stations and platforms on the map
      */
-    updateStations(stations: Station[], show: boolean): void {
+    updateStations(stations: Station[], show: boolean, showStopPositions = false, showPlatformElements = false): void {
         const stationSource = this.map.getSource("stations") as maplibregl.GeoJSONSource;
         const platformSource = this.map.getSource("platforms") as maplibregl.GeoJSONSource;
         const connectionSource = this.map.getSource("platform-connections") as maplibregl.GeoJSONSource;
-        if (!stationSource || !platformSource || !connectionSource) return;
+        const stopPositionSource = this.map.getSource("stop-positions") as maplibregl.GeoJSONSource;
+        const platformElementSource = this.map.getSource("platform-elements") as maplibregl.GeoJSONSource;
+        if (!stationSource || !platformSource || !connectionSource || !stopPositionSource || !platformElementSource) return;
 
         if (!show) {
             stationSource.setData({ type: "FeatureCollection", features: [] });
             platformSource.setData({ type: "FeatureCollection", features: [] });
             connectionSource.setData({ type: "FeatureCollection", features: [] });
+            stopPositionSource.setData({ type: "FeatureCollection", features: [] });
+            platformElementSource.setData({ type: "FeatureCollection", features: [] });
             return;
         }
 
@@ -123,6 +155,8 @@ export class MapLayerManager {
 
         const platformFeatures: GeoJSON.Feature[] = [];
         const connectionFeatures: GeoJSON.Feature[] = [];
+        const stopPositionFeatures: GeoJSON.Feature[] = [];
+        const platformElementFeatures: GeoJSON.Feature[] = [];
 
         for (const station of stations) {
             const stationCoord: [number, number] = [station.lon, station.lat];
@@ -143,6 +177,7 @@ export class MapLayerManager {
                 });
             };
 
+            // Original behavior: show deduplicated platforms and stop positions
             for (const platform of station.platforms) {
                 const name = getPlatformDisplayName(platform);
                 if (!addedNames.has(name)) {
@@ -157,11 +192,35 @@ export class MapLayerManager {
                     addPlatformFeature(stopPosition);
                 }
             }
+
+            // Additional stop position markers (blue)
+            if (showStopPositions) {
+                for (const stopPosition of station.stop_positions) {
+                    stopPositionFeatures.push({
+                        type: "Feature",
+                        properties: { name: getPlatformDisplayName(stopPosition), station_name: station.name, osm_id: stopPosition.osm_id },
+                        geometry: { type: "Point", coordinates: [stopPosition.lon, stopPosition.lat] },
+                    });
+                }
+            }
+
+            // Additional platform element markers (orange)
+            if (showPlatformElements) {
+                for (const platform of station.platforms) {
+                    platformElementFeatures.push({
+                        type: "Feature",
+                        properties: { name: getPlatformDisplayName(platform), station_name: station.name, osm_id: platform.osm_id },
+                        geometry: { type: "Point", coordinates: [platform.lon, platform.lat] },
+                    });
+                }
+            }
         }
 
         stationSource.setData({ type: "FeatureCollection", features: stationFeatures });
         platformSource.setData({ type: "FeatureCollection", features: platformFeatures });
         connectionSource.setData({ type: "FeatureCollection", features: connectionFeatures });
+        stopPositionSource.setData({ type: "FeatureCollection", features: stopPositionFeatures });
+        platformElementSource.setData({ type: "FeatureCollection", features: platformElementFeatures });
     }
 
     /**
@@ -217,6 +276,16 @@ export class MapLayerManager {
     clearVehicleData(): void {
         this.updateVehicles([]);
         this.updateVehicleModels([]);
+    }
+
+    /**
+     * Update debug segments visualization
+     */
+    updateDebugSegments(features: GeoJSON.Feature[]): void {
+        const source = this.map.getSource("debug-segments") as maplibregl.GeoJSONSource;
+        if (source) {
+            source.setData({ type: "FeatureCollection", features });
+        }
     }
 
     /**

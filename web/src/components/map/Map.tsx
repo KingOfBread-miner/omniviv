@@ -7,6 +7,7 @@ import type { RouteVehicles, RouteWithGeometry } from "../../App";
 import { PlatformPopup } from "../PlatformPopup";
 import { StationPopup } from "../StationPopup";
 import { VehicleRenderer } from "../vehicles/VehicleRenderer";
+import type { DebugOptions } from "../vehicles/VehicleRenderer";
 import { VehicleTracker, type TrackingInfo } from "../vehicles/VehicleTracker";
 import { MapLayerManager } from "./MapLayerManager";
 
@@ -20,8 +21,11 @@ interface MapProps {
     vehicles: RouteVehicles[];
     showAreaOutlines: boolean;
     showStations: boolean;
+    showStopPositions: boolean;
+    showPlatforms: boolean;
     showRoutes: boolean;
     showVehicles: boolean;
+    debugOptions: DebugOptions;
 }
 
 interface MapState {
@@ -73,8 +77,16 @@ export default class Map extends React.Component<MapProps, MapState> {
             if (prevProps.showAreaOutlines !== this.props.showAreaOutlines || prevProps.areas !== this.props.areas) {
                 this.layerManager.updateAreaOutlines(this.props.areas, this.props.showAreaOutlines);
             }
-            if (prevProps.showStations !== this.props.showStations || prevProps.stations !== this.props.stations) {
-                this.layerManager.updateStations(this.props.stations, this.props.showStations);
+            if (prevProps.showStations !== this.props.showStations ||
+                prevProps.showStopPositions !== this.props.showStopPositions ||
+                prevProps.showPlatforms !== this.props.showPlatforms ||
+                prevProps.stations !== this.props.stations) {
+                this.layerManager.updateStations(
+                    this.props.stations,
+                    this.props.showStations,
+                    this.props.showStopPositions,
+                    this.props.showPlatforms
+                );
             }
             if (prevProps.showRoutes !== this.props.showRoutes || prevProps.routes !== this.props.routes) {
                 this.layerManager.updateRoutes(this.props.routes, this.props.showRoutes);
@@ -89,6 +101,15 @@ export default class Map extends React.Component<MapProps, MapState> {
 
         if (prevState.trackedTripId !== this.state.trackedTripId) {
             this.handleTrackingChange(prevState.trackedTripId);
+            // Immediately update vehicles to refresh debug visualization
+            if (this.props.showVehicles) {
+                this.updateVehicles();
+            }
+        }
+
+        // Update vehicles when debug options change
+        if (prevProps.debugOptions !== this.props.debugOptions && this.props.showVehicles) {
+            this.updateVehicles();
         }
     }
 
@@ -133,7 +154,12 @@ export default class Map extends React.Component<MapProps, MapState> {
         if (!this.layerManager) return;
 
         this.layerManager.updateAreaOutlines(this.props.areas, this.props.showAreaOutlines);
-        this.layerManager.updateStations(this.props.stations, this.props.showStations);
+        this.layerManager.updateStations(
+            this.props.stations,
+            this.props.showStations,
+            this.props.showStopPositions,
+            this.props.showPlatforms
+        );
         this.layerManager.updateRoutes(this.props.routes, this.props.showRoutes);
 
         if (this.props.showVehicles) {
@@ -190,6 +216,28 @@ export default class Map extends React.Component<MapProps, MapState> {
 
         this.map.on("load", () => {
             if (!this.map) return;
+
+            // Enable globe projection
+            this.map.setProjection({ type: "globe" });
+
+            // Configure sky for globe - black space background
+            this.map.setSky({
+                "sky-color": "#000000",
+                "sky-horizon-blend": 0,
+                "horizon-color": "#000000",
+                "horizon-fog-blend": 0,
+                "fog-color": "#000000",
+                "fog-ground-blend": 0,
+                "atmosphere-blend": 0,
+            });
+
+            // Configure lighting for 3D features
+            this.map.setLight({
+                anchor: "viewport",
+                color: "#ffffff",
+                intensity: 0.5,
+                position: [1.5, 180, 50],
+            });
 
             // Initialize managers
             this.layerManager = new MapLayerManager(this.map);
@@ -293,6 +341,7 @@ export default class Map extends React.Component<MapProps, MapState> {
         if (!this.vehicleRenderer) return;
 
         this.vehicleRenderer.setTrackedTripId(this.state.trackedTripId);
+        this.vehicleRenderer.setDebugOptions(this.props.debugOptions);
         this.vehicleRenderer.updatePositions(this.props.vehicles, ANIMATION_INTERVAL);
     }
 
@@ -311,7 +360,7 @@ export default class Map extends React.Component<MapProps, MapState> {
         const { trackingInfo } = this.state;
 
         return (
-            <div className="relative w-full h-full">
+            <div className="relative w-full h-full bg-black">
                 <div ref={this.mapContainer} className="w-full h-full" />
                 {trackingInfo && (
                     <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-[calc(100%+50px)] pointer-events-none">

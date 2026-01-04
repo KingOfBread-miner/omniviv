@@ -9,33 +9,36 @@ import { calculateSegmentDistances, getAugsburgVehicleModel } from "./vehicleMod
 import {
     calculateVehiclePosition,
     createSmoothedPosition,
-    findPositionsAlongTrack,
+    getDebugSegmentFeatures,
+    getPositionsBehindOnRoute,
+    linearizeRoute,
     updateSmoothedPosition,
+    type LinearizedRoute,
     type SmoothedVehiclePosition,
     type VehiclePosition,
 } from "./vehicleUtils";
 
 const ANIMATION_INTERVAL = 50;
 
-interface SegmentPosition {
-    frontLon: number;
-    frontLat: number;
-    rearLon: number;
-    rearLat: number;
+export interface DebugOptions {
+    show3DModels: boolean;
+    showDebugSegments: boolean;
+    showDebugOnlyTracked: boolean;
 }
 
 export class VehicleRenderer {
     private layerManager: MapLayerManager;
     private routeColors: globalThis.Map<string, string>;
     private routeGeometries: globalThis.Map<number, number[][][]>;
+    private linearizedRoutes = new globalThis.Map<number, LinearizedRoute>();
     private smoothedPositions = new globalThis.Map<string, SmoothedVehiclePosition>();
-    private modelSegmentPositions = new globalThis.Map<string, SegmentPosition[]>();
     private vehicleIcons = new Set<string>();
     private animationId: number | null = null;
     private lastAnimationTime = 0;
 
     private onTrackedVehicleLost?: () => void;
     private trackedTripId: string | null = null;
+    private debugOptions: DebugOptions = { show3DModels: true, showDebugSegments: false, showDebugOnlyTracked: true };
 
     constructor(
         layerManager: MapLayerManager,
@@ -45,6 +48,20 @@ export class VehicleRenderer {
         this.layerManager = layerManager;
         this.routeColors = routeColors;
         this.routeGeometries = routeGeometries;
+        this.buildLinearizedRoutes();
+    }
+
+    /**
+     * Build linearized routes from route geometries
+     */
+    private buildLinearizedRoutes(): void {
+        this.linearizedRoutes.clear();
+        for (const [routeId, geometry] of this.routeGeometries) {
+            const linearized = linearizeRoute(geometry);
+            if (linearized) {
+                this.linearizedRoutes.set(routeId, linearized);
+            }
+        }
     }
 
     /**
@@ -56,6 +73,7 @@ export class VehicleRenderer {
     ): void {
         this.routeColors = routeColors;
         this.routeGeometries = routeGeometries;
+        this.buildLinearizedRoutes();
     }
 
     /**
@@ -70,6 +88,13 @@ export class VehicleRenderer {
      */
     setTrackedTripId(tripId: string | null): void {
         this.trackedTripId = tripId;
+    }
+
+    /**
+     * Set debug visualization options
+     */
+    setDebugOptions(options: DebugOptions): void {
+        this.debugOptions = options;
     }
 
     /**
@@ -116,8 +141,8 @@ export class VehicleRenderer {
     clear(): void {
         this.stopAnimation();
         this.layerManager.clearVehicleData();
+        this.layerManager.updateDebugSegments([]);
         this.smoothedPositions.clear();
-        this.modelSegmentPositions.clear();
     }
 
     /**
@@ -156,6 +181,7 @@ export class VehicleRenderer {
 
         const markerFeatures: GeoJSON.Feature[] = [];
         const modelFeatures: GeoJSON.Feature[] = [];
+        const debugFeatures: GeoJSON.Feature[] = [];
         const activeTripIds = new Set<string>();
 
         const vehicleModel = getAugsburgVehicleModel();
@@ -208,24 +234,39 @@ export class VehicleRenderer {
                 geometry: { type: "Point", coordinates: [smoothedPosition.renderedLon, smoothedPosition.renderedLat] },
             });
 
-            // Generate 3D model features using same smoothed position
-            const routeGeometry = this.routeGeometries.get(routeId) ?? [];
-            const segmentFeatures = this.generateModelFeatures(
-                targetPosition.tripId,
-                smoothedPosition,
-                routeGeometry,
-                routeColor,
-                vehicleModel,
-                segmentDistances
-            );
-            modelFeatures.push(...segmentFeatures);
+            // Generate 3D model features and debug visualization
+            const linearizedRoute = this.linearizedRoutes.get(routeId);
+            const isTracked = targetPosition.tripId === this.trackedTripId;
+
+            // Determine if we should show debug for this vehicle
+            const showDebugForThis = this.debugOptions.showDebugSegments &&
+                (!this.debugOptions.showDebugOnlyTracked || isTracked);
+
+            // Generate 3D models and/or debug visualization
+            if (this.debugOptions.show3DModels || showDebugForThis) {
+                const { modelFeatures: segmentFeatures, debugFeatures: segDebugFeatures } = this.generateModelFeatures(
+                    smoothedPosition,
+                    linearizedRoute,
+                    routeColor,
+                    vehicleModel,
+                    segmentDistances,
+                    showDebugForThis
+                );
+                // Only add 3D model features if enabled
+                if (this.debugOptions.show3DModels) {
+                    modelFeatures.push(...segmentFeatures);
+                }
+                // Only add debug features if requested for this vehicle
+                if (showDebugForThis) {
+                    debugFeatures.push(...segDebugFeatures);
+                }
+            }
         }
 
         // Cleanup old positions
         for (const tripId of this.smoothedPositions.keys()) {
             if (!activeTripIds.has(tripId)) {
                 this.smoothedPositions.delete(tripId);
-                this.modelSegmentPositions.delete(tripId);
             }
         }
 
@@ -234,86 +275,63 @@ export class VehicleRenderer {
             this.onTrackedVehicleLost?.();
         }
 
-        // Update both layers together
+        // Update all layers together
         this.layerManager.updateVehicles(markerFeatures);
         this.layerManager.updateVehicleModels(modelFeatures);
+        this.layerManager.updateDebugSegments(debugFeatures);
     }
 
     /**
-     * Generate 3D model features for a vehicle
+     * Generate 3D model features for a vehicle using linearized route
+     * Uses the linear position calculated during vehicle position interpolation (not proximity search)
      */
     private generateModelFeatures(
-        tripId: string,
         smoothedPosition: SmoothedVehiclePosition,
-        routeGeometry: number[][][],
+        linearizedRoute: LinearizedRoute | undefined,
         routeColor: string,
         vehicleModel: ReturnType<typeof getAugsburgVehicleModel>,
-        segmentDistances: ReturnType<typeof calculateSegmentDistances>
-    ): GeoJSON.Feature[] {
-        const features: GeoJSON.Feature[] = [];
+        segmentDistances: ReturnType<typeof calculateSegmentDistances>,
+        showDebug = false
+    ): { modelFeatures: GeoJSON.Feature[]; debugFeatures: GeoJSON.Feature[] } {
+        const modelFeatures: GeoJSON.Feature[] = [];
+        const debugFeatures: GeoJSON.Feature[] = [];
 
-        const lon = smoothedPosition.renderedLon;
-        const lat = smoothedPosition.renderedLat;
-        const bearing = smoothedPosition.renderedBearing;
+        // If no linearized route or no linear position info, don't render 3D model
+        if (!linearizedRoute || smoothedPosition.renderedLinearPosition === undefined) {
+            return { modelFeatures: [], debugFeatures: [] };
+        }
 
+        // Use the linear position that was calculated from the stop-to-stop interpolation
+        // This is NOT a proximity search - it comes from the actual route following logic
+        const linearPosition = smoothedPosition.renderedLinearPosition;
+
+        // Get all distances behind the vehicle for 3D model segments
         const allDistances: number[] = [];
         for (const segInfo of segmentDistances) {
             allDistances.push(segInfo.frontDistance, segInfo.rearDistance);
         }
 
-        const allTrackPositions = findPositionsAlongTrack(lon, lat, allDistances, bearing, routeGeometry);
+        // Get positions along the route behind the vehicle
+        const positions = getPositionsBehindOnRoute(linearizedRoute, linearPosition, allDistances);
 
-        const newPositions: SegmentPosition[] = [];
-        let allValid = true;
-        const lastValidPositions = this.modelSegmentPositions.get(tripId) ?? [];
-
+        // Generate 3D model polygons
         for (let i = 0; i < segmentDistances.length; i++) {
             const segInfo = segmentDistances[i];
-            const frontPos = allTrackPositions[i * 2];
-            const rearPos = allTrackPositions[i * 2 + 1];
+            const frontPos = positions[i * 2];
+            const rearPos = positions[i * 2 + 1];
 
-            const actualLength = this.distanceMeters(frontPos.lon, frontPos.lat, rearPos.lon, rearPos.lat);
-            const lengthRatio = actualLength / segInfo.segment.length;
+            const polygon = this.createSegmentPolygon(
+                frontPos.lon, frontPos.lat,
+                rearPos.lon, rearPos.lat,
+                vehicleModel.width
+            );
 
-            if (lengthRatio < 0.5 || lengthRatio > 1.5) {
-                allValid = false;
-                break;
-            }
-
-            if (lastValidPositions.length > 0 && lastValidPositions[i]) {
-                const lastFront = lastValidPositions[i];
-                const frontMovement = this.distanceMeters(lastFront.frontLon, lastFront.frontLat, frontPos.lon, frontPos.lat);
-                if (frontMovement > 20) {
-                    allValid = false;
-                    break;
-                }
-            }
-
-            newPositions.push({
-                frontLon: frontPos.lon,
-                frontLat: frontPos.lat,
-                rearLon: rearPos.lon,
-                rearLat: rearPos.lat,
-            });
-        }
-
-        const positionsToUse = (allValid && newPositions.length === segmentDistances.length) ? newPositions : lastValidPositions;
-        if (allValid && newPositions.length === segmentDistances.length) {
-            this.modelSegmentPositions.set(tripId, newPositions);
-        }
-
-        for (let i = 0; i < segmentDistances.length && i < positionsToUse.length; i++) {
-            const segInfo = segmentDistances[i];
-            const pos = positionsToUse[i];
-            if (!pos) continue;
-
-            const polygon = this.createSegmentPolygon(pos.frontLon, pos.frontLat, pos.rearLon, pos.rearLat, vehicleModel.width);
             if (polygon.length > 0) {
-                features.push({
+                modelFeatures.push({
                     type: "Feature",
                     properties: {
                         color: routeColor,
-                        tripId,
+                        tripId: smoothedPosition.tripId,
                         carIndex: segInfo.index,
                         height: segInfo.segment.height,
                     },
@@ -322,20 +340,27 @@ export class VehicleRenderer {
             }
         }
 
-        return features;
+        // Generate debug segment visualization if this is the tracked vehicle
+        if (showDebug) {
+            // Find current segment from linear position
+            const segmentIndex = this.findSegmentIndexFromLinearPosition(linearizedRoute, linearPosition);
+            const segDebug = getDebugSegmentFeatures(linearizedRoute, segmentIndex, 5, 5);
+            debugFeatures.push(...segDebug);
+        }
+
+        return { modelFeatures, debugFeatures };
     }
 
     /**
-     * Calculate distance in meters between two coordinates
+     * Find segment index from a linear position along the route
      */
-    private distanceMeters(lon1: number, lat1: number, lon2: number, lat2: number): number {
-        const R = 6371000;
-        const phi1 = (lat1 * Math.PI) / 180;
-        const phi2 = (lat2 * Math.PI) / 180;
-        const dPhi = ((lat2 - lat1) * Math.PI) / 180;
-        const dLambda = ((lon2 - lon1) * Math.PI) / 180;
-        const a = Math.sin(dPhi / 2) ** 2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dLambda / 2) ** 2;
-        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    private findSegmentIndexFromLinearPosition(route: LinearizedRoute, linearPosition: number): number {
+        for (let i = 0; i < route.distances.length - 1; i++) {
+            if (linearPosition <= route.distances[i + 1]) {
+                return i;
+            }
+        }
+        return route.coords.length - 2;
     }
 
     /**
@@ -378,6 +403,6 @@ export class VehicleRenderer {
         this.stopAnimation();
         this.vehicleIcons.clear();
         this.smoothedPositions.clear();
-        this.modelSegmentPositions.clear();
+        this.linearizedRoutes.clear();
     }
 }

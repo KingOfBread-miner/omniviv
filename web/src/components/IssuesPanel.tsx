@@ -1,4 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 
 // Types matching the backend API
 type TransportType = "tram" | "bus" | "train" | "unknown";
@@ -37,14 +39,14 @@ const ISSUE_TYPE_LABELS: Record<OsmIssue["issue_type"], string> = {
     missing_platform: "Missing Platform",
 };
 
-const ISSUE_TYPE_COLORS: Record<OsmIssue["issue_type"], string> = {
-    missing_ifopt: "bg-yellow-100 text-yellow-800",
-    missing_coordinates: "bg-red-100 text-red-800",
-    orphaned_element: "bg-orange-100 text-orange-800",
-    missing_route_ref: "bg-blue-100 text-blue-800",
-    missing_name: "bg-purple-100 text-purple-800",
-    missing_stop_position: "bg-cyan-100 text-cyan-800",
-    missing_platform: "bg-pink-100 text-pink-800",
+const ISSUE_TYPE_VARIANTS: Record<OsmIssue["issue_type"], "default" | "secondary" | "destructive" | "outline"> = {
+    missing_ifopt: "default",
+    missing_coordinates: "destructive",
+    orphaned_element: "secondary",
+    missing_route_ref: "outline",
+    missing_name: "secondary",
+    missing_stop_position: "outline",
+    missing_platform: "outline",
 };
 
 const TRANSPORT_TYPE_LABELS: Record<TransportType, string> = {
@@ -61,10 +63,12 @@ const TRANSPORT_TYPE_ICONS: Record<TransportType, string> = {
     unknown: "❓",
 };
 
-function IssueItem({ issue }: { issue: OsmIssue }) {
-    const [copied, setCopied] = useState(false);
+interface IssueItemProps {
+    issue: OsmIssue;
+}
 
-    // Format IFOPT as OSM tag format for easy copying
+function IssueItem({ issue }: IssueItemProps) {
+    const [copied, setCopied] = useState(false);
     const ifoptTag = issue.suggested_ifopt ? `ref:IFOPT=${issue.suggested_ifopt}` : null;
 
     const handleCopyIfopt = async () => {
@@ -76,65 +80,66 @@ function IssueItem({ issue }: { issue: OsmIssue }) {
     };
 
     return (
-        <li className="p-3 hover:bg-gray-50">
+        <li className="p-3 hover:bg-muted/50 rounded-lg">
             <div className="flex items-start justify-between gap-2">
                 <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1">
-                        <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${ISSUE_TYPE_COLORS[issue.issue_type]}`}>
+                        <Badge variant={ISSUE_TYPE_VARIANTS[issue.issue_type]}>
                             {ISSUE_TYPE_LABELS[issue.issue_type]}
-                        </span>
-                        <span className="text-xs text-gray-400">{issue.element_type}</span>
+                        </Badge>
+                        <span className="text-xs text-muted-foreground">{issue.element_type}</span>
                         <span className="text-xs" title={TRANSPORT_TYPE_LABELS[issue.transport_type]}>
                             {TRANSPORT_TYPE_ICONS[issue.transport_type]}
                         </span>
                     </div>
-                    <p className="text-sm text-gray-700 truncate">
+                    <p className="text-sm font-medium truncate">
                         {issue.name || `${issue.osm_type}/${issue.osm_id}`}
                     </p>
-                    <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">
+                    <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">
                         {issue.description}
                     </p>
                     {ifoptTag && (
-                        <div className="mt-2 p-2 bg-green-50 rounded border border-green-200">
+                        <div className="mt-2 p-2 bg-green-50 dark:bg-green-950 rounded border border-green-200 dark:border-green-800">
                             <div className="flex items-center justify-between gap-2">
                                 <div className="min-w-0">
-                                    <p className="text-xs text-green-800 font-medium">Suggested tag:</p>
-                                    <p className="text-xs text-green-700 font-mono truncate">{ifoptTag}</p>
+                                    <p className="text-xs text-green-800 dark:text-green-200 font-medium">Suggested tag:</p>
+                                    <p className="text-xs text-green-700 dark:text-green-300 font-mono truncate">{ifoptTag}</p>
                                     {issue.suggested_ifopt_name && (
-                                        <p className="text-xs text-green-600 truncate">{issue.suggested_ifopt_name}</p>
+                                        <p className="text-xs text-green-600 dark:text-green-400 truncate">{issue.suggested_ifopt_name}</p>
                                     )}
                                     {issue.suggested_ifopt_distance !== null && (
                                         <p className="text-xs text-green-500">{issue.suggested_ifopt_distance}m away</p>
                                     )}
                                 </div>
-                                <button
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
                                     onClick={handleCopyIfopt}
-                                    className="shrink-0 px-2 py-1 text-xs font-medium text-green-700 hover:text-green-900 hover:bg-green-100 rounded transition-colors"
-                                    title="Copy tag to clipboard"
+                                    className="shrink-0 text-green-700 hover:text-green-900 hover:bg-green-100"
                                 >
                                     {copied ? "Copied!" : "Copy"}
-                                </button>
+                                </Button>
                             </div>
                         </div>
                     )}
                 </div>
-                <a
-                    href={issue.osm_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="shrink-0 px-2 py-1 text-xs font-medium text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded transition-colors"
-                >
-                    Edit
-                </a>
+                <Button variant="link" size="sm" asChild className="shrink-0">
+                    <a
+                        href={issue.osm_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                    >
+                        Edit
+                    </a>
+                </Button>
             </div>
         </li>
     );
 }
 
-export function IssuesPanel() {
+export function OsmIssuesPanel() {
     const [issues, setIssues] = useState<OsmIssue[]>([]);
     const [isLoading, setIsLoading] = useState(true);
-    const [isExpanded, setIsExpanded] = useState(false);
     const [selectedIssueType, setSelectedIssueType] = useState<OsmIssue["issue_type"] | "all">("all");
     const [selectedTransportType, setSelectedTransportType] = useState<TransportType | "all">("all");
 
@@ -154,152 +159,108 @@ export function IssuesPanel() {
         };
 
         fetchIssues();
-        // Refresh every 5 minutes
-        const interval = setInterval(fetchIssues, 5 * 60 * 1000);
-        return () => clearInterval(interval);
     }, []);
 
-    // Filter by both issue type and transport type
-    const filteredIssues = issues.filter(issue => {
-        const matchesIssueType = selectedIssueType === "all" || issue.issue_type === selectedIssueType;
-        const matchesTransportType = selectedTransportType === "all" || issue.transport_type === selectedTransportType;
-        return matchesIssueType && matchesTransportType;
-    });
+    const filteredIssues = useMemo(() =>
+        issues.filter(issue => {
+            const matchesIssueType = selectedIssueType === "all" || issue.issue_type === selectedIssueType;
+            const matchesTransportType = selectedTransportType === "all" || issue.transport_type === selectedTransportType;
+            return matchesIssueType && matchesTransportType;
+        }),
+        [issues, selectedIssueType, selectedTransportType]
+    );
 
-    const issuesByType = issues.reduce((acc, issue) => {
-        acc[issue.issue_type] = (acc[issue.issue_type] || 0) + 1;
-        return acc;
-    }, {} as Record<string, number>);
+    const issuesByType = useMemo(() =>
+        issues.reduce((acc, issue) => {
+            acc[issue.issue_type] = (acc[issue.issue_type] || 0) + 1;
+            return acc;
+        }, {} as Record<string, number>),
+        [issues]
+    );
 
-    const issuesByTransportType = issues.reduce((acc, issue) => {
-        acc[issue.transport_type] = (acc[issue.transport_type] || 0) + 1;
-        return acc;
-    }, {} as Record<string, number>);
-
-    if (isLoading) {
-        return null;
-    }
-
-    if (issues.length === 0) {
-        return null;
-    }
+    const issuesByTransportType = useMemo(() =>
+        issues.reduce((acc, issue) => {
+            acc[issue.transport_type] = (acc[issue.transport_type] || 0) + 1;
+            return acc;
+        }, {} as Record<string, number>),
+        [issues]
+    );
 
     return (
-        <div className="absolute bottom-4 right-4 z-20">
-            {!isExpanded ? (
-                <button
-                    onClick={() => setIsExpanded(true)}
-                    className="bg-white rounded-lg shadow-lg p-3 flex items-center gap-2 hover:bg-gray-50 transition-colors"
-                >
-                    <svg
-                        width="20"
-                        height="20"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        className="text-orange-500"
-                    >
-                        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-                        <line x1="12" y1="9" x2="12" y2="13" />
-                        <line x1="12" y1="17" x2="12.01" y2="17" />
-                    </svg>
-                    <span className="font-medium text-gray-700">{issues.length} OSM Issues</span>
-                </button>
-            ) : (
-                <div className="bg-white rounded-lg shadow-lg w-96 max-h-[70vh] flex flex-col">
-                    <div className="flex items-center justify-between p-4 border-b">
-                        <h3 className="font-semibold text-gray-900">OSM Data Issues ({issues.length})</h3>
-                        <button
-                            onClick={() => setIsExpanded(false)}
-                            className="text-gray-400 hover:text-gray-600"
-                        >
-                            <svg
-                                width="20"
-                                height="20"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                            >
-                                <path d="M18 6L6 18M6 6l12 12" />
-                            </svg>
-                        </button>
-                    </div>
+        <div className="h-full flex flex-col">
+            <div className="p-4 border-b">
+                <h2 className="font-semibold">OSM Data Issues ({issues.length})</h2>
+            </div>
 
-                    <div className="p-3 border-b space-y-2">
+            {isLoading ? (
+                <div className="flex items-center justify-center py-8 flex-1">
+                    <p className="text-muted-foreground">Loading issues...</p>
+                </div>
+            ) : (
+                <>
+                    <div className="p-4 space-y-2 border-b">
                         {/* Transport type filter */}
-                        <div className="flex flex-wrap gap-1">
-                            <span className="text-xs text-gray-500 mr-1">Transport:</span>
-                            <button
+                        <div className="flex flex-wrap gap-1 items-center">
+                            <span className="text-xs text-muted-foreground mr-1">Transport:</span>
+                            <Button
+                                variant={selectedTransportType === "all" ? "default" : "outline"}
+                                size="sm"
                                 onClick={() => setSelectedTransportType("all")}
-                                className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
-                                    selectedTransportType === "all"
-                                        ? "bg-gray-800 text-white"
-                                        : "bg-gray-100 text-gray-600 hover:bg-gray-200"
-                                }`}
+                                className="h-6 text-xs"
                             >
                                 All
-                            </button>
+                            </Button>
                             {(["tram", "bus", "train"] as TransportType[]).map((type) => {
                                 const count = issuesByTransportType[type] || 0;
                                 if (count === 0) return null;
                                 return (
-                                    <button
+                                    <Button
                                         key={type}
+                                        variant={selectedTransportType === type ? "default" : "outline"}
+                                        size="sm"
                                         onClick={() => setSelectedTransportType(type)}
-                                        className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
-                                            selectedTransportType === type
-                                                ? "bg-gray-800 text-white"
-                                                : "bg-gray-100 text-gray-600 hover:bg-gray-200"
-                                        }`}
+                                        className="h-6 text-xs"
                                     >
                                         {TRANSPORT_TYPE_ICONS[type]} {TRANSPORT_TYPE_LABELS[type]} ({count})
-                                    </button>
+                                    </Button>
                                 );
                             })}
                         </div>
 
                         {/* Issue type filter */}
-                        <div className="flex flex-wrap gap-1">
-                            <span className="text-xs text-gray-500 mr-1">Issue:</span>
-                            <button
+                        <div className="flex flex-wrap gap-1 items-center">
+                            <span className="text-xs text-muted-foreground mr-1">Issue:</span>
+                            <Button
+                                variant={selectedIssueType === "all" ? "default" : "outline"}
+                                size="sm"
                                 onClick={() => setSelectedIssueType("all")}
-                                className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
-                                    selectedIssueType === "all"
-                                        ? "bg-gray-800 text-white"
-                                        : "bg-gray-100 text-gray-600 hover:bg-gray-200"
-                                }`}
+                                className="h-6 text-xs"
                             >
                                 All
-                            </button>
+                            </Button>
                             {(Object.keys(ISSUE_TYPE_LABELS) as OsmIssue["issue_type"][]).map((type) => {
                                 const count = issuesByType[type] || 0;
                                 if (count === 0) return null;
                                 return (
-                                    <button
+                                    <Button
                                         key={type}
+                                        variant={selectedIssueType === type ? "default" : "outline"}
+                                        size="sm"
                                         onClick={() => setSelectedIssueType(type)}
-                                        className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
-                                            selectedIssueType === type
-                                                ? "bg-gray-800 text-white"
-                                                : `${ISSUE_TYPE_COLORS[type]} hover:opacity-80`
-                                        }`}
+                                        className="h-6 text-xs"
                                     >
                                         {ISSUE_TYPE_LABELS[type]} ({count})
-                                    </button>
+                                    </Button>
                                 );
                             })}
                         </div>
                     </div>
 
-                    <div className="overflow-y-auto flex-1">
+                    <div className="overflow-y-auto flex-1 px-2">
                         {filteredIssues.length === 0 ? (
-                            <p className="p-4 text-gray-500 text-center">No issues in this category</p>
+                            <p className="py-8 text-center text-muted-foreground">No issues in this category</p>
                         ) : (
-                            <ul className="divide-y divide-gray-100">
+                            <ul className="divide-y">
                                 {filteredIssues.map((issue) => (
                                     <IssueItem key={`${issue.osm_type}-${issue.osm_id}`} issue={issue} />
                                 ))}
@@ -307,10 +268,10 @@ export function IssuesPanel() {
                         )}
                     </div>
 
-                    <div className="p-3 border-t bg-gray-50 text-xs text-gray-500">
+                    <div className="p-3 border-t text-xs text-muted-foreground">
                         Click "Edit" to fix issues in OpenStreetMap
                     </div>
-                </div>
+                </>
             )}
         </div>
     );

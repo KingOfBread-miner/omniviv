@@ -12,6 +12,74 @@ export interface VehiclePosition {
     nextStop?: VehicleStop;
     progress: number; // 0-1 progress between stops
     delayMinutes: number | null;
+    // Route position info for 3D model placement
+    routeSegmentIndex?: number;      // Which segment of the flattened route the vehicle is on
+    routeLinearPosition?: number;    // Distance from start of route in meters
+}
+
+/**
+ * Find the linear position of a coordinate on the route geometry
+ * Returns the distance from the start of the route to the closest point
+ */
+function findLinearPositionOnRoute(
+    lon: number,
+    lat: number,
+    routeGeometry: number[][][]
+): { linearPosition: number; segmentIndex: number } | null {
+    if (!routeGeometry || routeGeometry.length === 0) return null;
+
+    // Flatten route and calculate cumulative distances
+    const allCoords: number[][] = [];
+    const cumulativeDistances: number[] = [];
+    let totalLength = 0;
+
+    for (const segment of routeGeometry) {
+        for (const coord of segment) {
+            if (allCoords.length > 0) {
+                const lastCoord = allCoords[allCoords.length - 1];
+                if (lastCoord[0] === coord[0] && lastCoord[1] === coord[1]) continue;
+                totalLength += haversineDistance(lastCoord, coord);
+            }
+            allCoords.push(coord);
+            cumulativeDistances.push(totalLength);
+        }
+    }
+
+    if (allCoords.length < 2) return null;
+
+    // Find the closest point on any segment
+    let bestDist = Infinity;
+    let bestLinearPos = 0;
+    let bestSegIdx = 0;
+
+    for (let i = 0; i < allCoords.length - 1; i++) {
+        const p1 = allCoords[i];
+        const p2 = allCoords[i + 1];
+
+        // Project point onto segment
+        const dx = p2[0] - p1[0];
+        const dy = p2[1] - p1[1];
+        const lengthSq = dx * dx + dy * dy;
+
+        let t = 0;
+        if (lengthSq > 0) {
+            t = ((lon - p1[0]) * dx + (lat - p1[1]) * dy) / lengthSq;
+            t = Math.max(0, Math.min(1, t));
+        }
+
+        const projLon = p1[0] + t * dx;
+        const projLat = p1[1] + t * dy;
+        const dist = haversineDistance([lon, lat], [projLon, projLat]);
+
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestSegIdx = i;
+            const segLength = cumulativeDistances[i + 1] - cumulativeDistances[i];
+            bestLinearPos = cumulativeDistances[i] + t * segLength;
+        }
+    }
+
+    return { linearPosition: bestLinearPos, segmentIndex: bestSegIdx };
 }
 
 /**
@@ -41,6 +109,9 @@ export function calculateVehiclePosition(
         // Use arrival time as departure time fallback for stops with only arrival data
         const effectiveDeparture = departureTime ?? arrivalTime;
         if (arrivalTime && effectiveDeparture && now >= arrivalTime && now <= effectiveDeparture) {
+            // Find where this stop is on the route
+            const routePos = findLinearPositionOnRoute(stop.lon, stop.lat, routeGeometry);
+
             // If this is the last stop, mark as completed
             if (i === stops.length - 1) {
                 return {
@@ -54,6 +125,8 @@ export function calculateVehiclePosition(
                     currentStop: stop,
                     progress: 1,
                     delayMinutes: stop.delay_minutes ?? null,
+                    routeSegmentIndex: routePos?.segmentIndex,
+                    routeLinearPosition: routePos?.linearPosition,
                 };
             }
             return {
@@ -68,6 +141,8 @@ export function calculateVehiclePosition(
                 nextStop: stops[i + 1],
                 progress: 0,
                 delayMinutes: stop.delay_minutes ?? null,
+                routeSegmentIndex: routePos?.segmentIndex,
+                routeLinearPosition: routePos?.linearPosition,
             };
         }
 
@@ -88,6 +163,9 @@ export function calculateVehiclePosition(
         // Check if vehicle hasn't departed yet (before first departure)
         // Show vehicle waiting at first stop
         if (i === 0 && departureTime && now < departureTime) {
+            // Find where first stop is on the route
+            const routePos = findLinearPositionOnRoute(stop.lon, stop.lat, routeGeometry);
+
             return {
                 tripId: vehicle.trip_id,
                 lineNumber: vehicle.line_number,
@@ -100,6 +178,8 @@ export function calculateVehiclePosition(
                 nextStop: stops[1],
                 progress: 0,
                 delayMinutes: stop.delay_minutes ?? null,
+                routeSegmentIndex: routePos?.segmentIndex,
+                routeLinearPosition: routePos?.linearPosition,
             };
         }
     }
@@ -112,6 +192,7 @@ export function calculateVehiclePosition(
 
     if (lastTime && now > lastTime) {
         // Journey is complete - return completed status (will be filtered out)
+        const routePos = findLinearPositionOnRoute(lastStop.lon, lastStop.lat, routeGeometry);
         return {
             tripId: vehicle.trip_id,
             lineNumber: vehicle.line_number,
@@ -123,6 +204,8 @@ export function calculateVehiclePosition(
             currentStop: lastStop,
             progress: 1,
             delayMinutes: lastStop.delay_minutes ?? null,
+            routeSegmentIndex: routePos?.segmentIndex,
+            routeLinearPosition: routePos?.linearPosition,
         };
     }
 
@@ -154,6 +237,8 @@ export function calculateVehiclePosition(
             nextStop: nextStop,
             progress,
             delayMinutes: prevStop.delay_minutes ?? nextStop.delay_minutes ?? null,
+            routeSegmentIndex: position.segmentIndex,
+            routeLinearPosition: position.linearPosition,
         };
     }
 
@@ -163,6 +248,7 @@ export function calculateVehiclePosition(
     if (firstDeparture && now > firstDeparture) {
         // First departure is in the past but we couldn't find a valid segment
         // This means all stops are likely in the past - mark as completed
+        const routePos = findLinearPositionOnRoute(lastStop.lon, lastStop.lat, routeGeometry);
         return {
             tripId: vehicle.trip_id,
             lineNumber: vehicle.line_number,
@@ -174,10 +260,13 @@ export function calculateVehiclePosition(
             currentStop: lastStop,
             progress: 1,
             delayMinutes: lastStop.delay_minutes ?? null,
+            routeSegmentIndex: routePos?.segmentIndex,
+            routeLinearPosition: routePos?.linearPosition,
         };
     }
 
     // Vehicle hasn't started yet - show at first stop as waiting
+    const routePos = findLinearPositionOnRoute(firstStop.lon, firstStop.lat, routeGeometry);
     return {
         tripId: vehicle.trip_id,
         lineNumber: vehicle.line_number,
@@ -190,6 +279,8 @@ export function calculateVehiclePosition(
         nextStop: stops[1],
         progress: 0,
         delayMinutes: firstStop.delay_minutes ?? null,
+        routeSegmentIndex: routePos?.segmentIndex,
+        routeLinearPosition: routePos?.linearPosition,
     };
 }
 
@@ -229,21 +320,34 @@ function calculateBearing(from: VehicleStop | undefined, to: VehicleStop | undef
 
 /**
  * Interpolate position along route geometry between two stops
+ * Returns position, bearing, and route tracking info (segment index and linear position)
  */
 function interpolatePositionAlongRoute(
     fromStop: VehicleStop,
     toStop: VehicleStop,
     progress: number,
     routeGeometry: number[][][]
-): { lon: number; lat: number; bearing: number } {
+): { lon: number; lat: number; bearing: number; segmentIndex?: number; linearPosition?: number } {
     // Find the route segment(s) between the two stops
     const fromCoord = [fromStop.lon, fromStop.lat];
     const toCoord = [toStop.lon, toStop.lat];
 
-    // Flatten all segments into a single path
+    // Flatten all segments into a single path and calculate cumulative distances
     const allCoords: number[][] = [];
+    const cumulativeDistances: number[] = [];
+    let totalRouteLength = 0;
+
     for (const segment of routeGeometry) {
-        allCoords.push(...segment);
+        for (const coord of segment) {
+            if (allCoords.length > 0) {
+                const lastCoord = allCoords[allCoords.length - 1];
+                // Skip duplicates
+                if (lastCoord[0] === coord[0] && lastCoord[1] === coord[1]) continue;
+                totalRouteLength += haversineDistance(lastCoord, coord);
+            }
+            allCoords.push(coord);
+            cumulativeDistances.push(totalRouteLength);
+        }
     }
 
     if (allCoords.length < 2) {
@@ -259,13 +363,20 @@ function interpolatePositionAlongRoute(
         return linearInterpolate(fromCoord, toCoord, progress);
     }
 
-    // Extract the path between the two indices, respecting travel direction
+    // Determine direction: are we going forward or backward along the geometry?
+    const goingForward = fromIdx < toIdx;
     const startIdx = Math.min(fromIdx, toIdx);
     const endIdx = Math.max(fromIdx, toIdx);
+
+    // Calculate the linear position at fromIdx and toIdx
+    const fromLinearPos = cumulativeDistances[fromIdx];
+    const toLinearPos = cumulativeDistances[toIdx];
+
+    // Extract the path between the two indices
     let pathSegment = allCoords.slice(startIdx, endIdx + 1);
 
     // If traveling opposite to geometry direction, reverse the path
-    if (fromIdx > toIdx) {
+    if (!goingForward) {
         pathSegment = pathSegment.slice().reverse();
     }
 
@@ -289,25 +400,42 @@ function interpolatePositionAlongRoute(
         if (lengths[i] >= targetLength) {
             const segmentStart = lengths[i - 1];
             const segmentEnd = lengths[i];
-            const segmentProgress = (targetLength - segmentStart) / (segmentEnd - segmentStart);
+            const segmentProgress = segmentEnd > segmentStart
+                ? (targetLength - segmentStart) / (segmentEnd - segmentStart)
+                : 0;
 
             const lon = pathSegment[i - 1][0] + (pathSegment[i][0] - pathSegment[i - 1][0]) * segmentProgress;
             const lat = pathSegment[i - 1][1] + (pathSegment[i][1] - pathSegment[i - 1][1]) * segmentProgress;
-
-            // Calculate bearing for this segment
             const bearing = calculateBearingCoords(pathSegment[i - 1], pathSegment[i]);
 
-            return { lon, lat, bearing };
+            // Calculate the actual segment index in the original flattened array
+            // i-1 is the index within pathSegment, need to map back to allCoords
+            const segmentIndexInPath = i - 1;
+            const actualSegmentIndex = goingForward
+                ? startIdx + segmentIndexInPath
+                : endIdx - segmentIndexInPath;
+
+            // Calculate linear position along the full route
+            const linearPosition = goingForward
+                ? fromLinearPos + targetLength
+                : fromLinearPos - targetLength;
+
+            return { lon, lat, bearing, segmentIndex: actualSegmentIndex, linearPosition };
         }
     }
 
     // Fallback to end of path
     const lastCoord = pathSegment[pathSegment.length - 1];
     const prevCoord = pathSegment[pathSegment.length - 2];
+    const finalSegmentIndex = goingForward ? endIdx - 1 : startIdx;
+    const finalLinearPosition = goingForward ? toLinearPos : fromLinearPos - totalLength;
+
     return {
         lon: lastCoord[0],
         lat: lastCoord[1],
         bearing: calculateBearingCoords(prevCoord, lastCoord),
+        segmentIndex: finalSegmentIndex,
+        linearPosition: finalLinearPosition,
     };
 }
 
@@ -369,153 +497,181 @@ function calculateBearingCoords(from: number[], to: number[]): number {
 }
 
 /**
- * Find multiple positions along the track at specific distances from a reference point.
- * Walks backwards along the route geometry to follow track curves.
+ * Linearized route with cumulative distances for efficient position lookups
  */
-export function findPositionsAlongTrack(
-    refLon: number,
-    refLat: number,
-    distances: number[],
-    bearing: number,
-    routeGeometry: number[][][]
-): Array<{ lon: number; lat: number; bearing: number }> {
-    // If no geometry, fall back to straight line
-    if (!routeGeometry || routeGeometry.length === 0) {
-        return straightLinePositions(refLon, refLat, distances, bearing);
-    }
+export interface LinearizedRoute {
+    coords: number[][];      // All coordinates in order
+    distances: number[];     // Cumulative distance at each coordinate
+    totalLength: number;     // Total route length in meters
+}
 
-    // Flatten route geometry
-    const allCoords: number[][] = [];
+/**
+ * Linearize route geometry into a single path with cumulative distances
+ */
+export function linearizeRoute(routeGeometry: number[][][]): LinearizedRoute | null {
+    if (!routeGeometry || routeGeometry.length === 0) return null;
+
+    const coords: number[][] = [];
+    const distances: number[] = [];
+    let totalLength = 0;
+
     for (const segment of routeGeometry) {
-        allCoords.push(...segment);
-    }
-
-    if (allCoords.length < 2) {
-        return straightLinePositions(refLon, refLat, distances, bearing);
-    }
-
-    // Find the segment where the vehicle is located (using bearing to pick correct track)
-    const vehicleSegment = findVehicleSegment(allCoords, refLon, refLat, bearing);
-    if (vehicleSegment === null) {
-        return straightLinePositions(refLon, refLat, distances, bearing);
-    }
-
-    // Calculate cumulative distances along track (backwards from vehicle position)
-    // We walk backwards from the vehicle segment
-    const { segmentIndex, t: vehicleT } = vehicleSegment;
-
-    // Build path going backwards from vehicle position
-    const backwardsPath: Array<{ lon: number; lat: number; dist: number }> = [];
-    let cumulativeDist = 0;
-
-    // First point is the vehicle position itself
-    backwardsPath.push({ lon: refLon, lat: refLat, dist: 0 });
-
-    // Add the start of current segment (walking backwards)
-    const segStart = allCoords[segmentIndex];
-    const segEnd = allCoords[segmentIndex + 1];
-    const distToSegStart = haversineDistanceForTrack([refLon, refLat], segStart) ;
-
-    // Only add segment start if we're not already there
-    if (vehicleT > 0.01) {
-        cumulativeDist = distToSegStart;
-        backwardsPath.push({ lon: segStart[0], lat: segStart[1], dist: cumulativeDist });
-    }
-
-    // Continue backwards through previous segments
-    for (let i = segmentIndex - 1; i >= 0; i--) {
-        const prevStart = allCoords[i];
-        const prevEnd = allCoords[i + 1];
-        const segLength = haversineDistanceForTrack(prevStart, prevEnd);
-        cumulativeDist += segLength;
-        backwardsPath.push({ lon: prevStart[0], lat: prevStart[1], dist: cumulativeDist });
-
-        // Stop if we've gone far enough (max tram length ~50m + buffer)
-        if (cumulativeDist > 60) break;
-    }
-
-    // For each requested distance, interpolate position along backwards path
-    return distances.map(targetDist => {
-        if (targetDist === 0) {
-            return { lon: refLon, lat: refLat, bearing };
-        }
-
-        // Find the two path points that bracket this distance
-        for (let i = 0; i < backwardsPath.length - 1; i++) {
-            const p1 = backwardsPath[i];
-            const p2 = backwardsPath[i + 1];
-
-            if (targetDist >= p1.dist && targetDist <= p2.dist) {
-                // Interpolate between p1 and p2
-                const segDist = p2.dist - p1.dist;
-                const t = segDist > 0 ? (targetDist - p1.dist) / segDist : 0;
-
-                const lon = p1.lon + (p2.lon - p1.lon) * t;
-                const lat = p1.lat + (p2.lat - p1.lat) * t;
-                const segBearing = calculateBearingCoords([p2.lon, p2.lat], [p1.lon, p1.lat]);
-
-                return { lon, lat, bearing: segBearing };
+        for (const coord of segment) {
+            if (coords.length > 0) {
+                const lastCoord = coords[coords.length - 1];
+                // Skip duplicate coordinates
+                if (lastCoord[0] === coord[0] && lastCoord[1] === coord[1]) continue;
+                totalLength += haversineDistance(lastCoord, coord);
             }
+            coords.push(coord);
+            distances.push(totalLength);
         }
+    }
 
-        // If we've gone past the end of our path, extrapolate from the last segment
-        const lastIdx = backwardsPath.length - 1;
-        if (lastIdx > 0) {
-            const last = backwardsPath[lastIdx];
-            const prev = backwardsPath[lastIdx - 1];
-            const extraDist = targetDist - last.dist;
-            const segBearing = calculateBearingCoords([prev.lon, prev.lat], [last.lon, last.lat]);
-            const behindRad = (segBearing * Math.PI) / 180;
-            const metersPerDegreeLat = 111320;
-            const metersPerDegreeLon = 111320 * Math.cos((last.lat * Math.PI) / 180);
+    if (coords.length < 2) return null;
+    return { coords, distances, totalLength };
+}
+
+/**
+ * Find where a point is located on a linearized route
+ * Returns the linear position (distance from start) and segment info
+ */
+export function findPositionOnRoute(
+    route: LinearizedRoute,
+    lon: number,
+    lat: number
+): { linearPosition: number; segmentIndex: number; t: number; distance: number } {
+    let bestDist = Infinity;
+    let bestLinearPos = 0;
+    let bestSegIdx = 0;
+    let bestT = 0;
+
+    for (let i = 0; i < route.coords.length - 1; i++) {
+        const p1 = route.coords[i];
+        const p2 = route.coords[i + 1];
+
+        // Project point onto segment
+        const projection = projectPointOnSegment(lon, lat, p1[0], p1[1], p2[0], p2[1]);
+
+        if (projection.distance < bestDist) {
+            bestDist = projection.distance;
+            bestSegIdx = i;
+            bestT = projection.t;
+            // Linear position = distance to segment start + t * segment length
+            const segLength = route.distances[i + 1] - route.distances[i];
+            bestLinearPos = route.distances[i] + projection.t * segLength;
+        }
+    }
+
+    return { linearPosition: bestLinearPos, segmentIndex: bestSegIdx, t: bestT, distance: bestDist };
+}
+
+/**
+ * Get the position at a specific linear distance along the route
+ */
+export function getPositionAtDistance(
+    route: LinearizedRoute,
+    linearPosition: number
+): { lon: number; lat: number; bearing: number; segmentIndex: number } {
+    // Clamp to route bounds
+    if (linearPosition <= 0) {
+        return {
+            lon: route.coords[0][0],
+            lat: route.coords[0][1],
+            bearing: calculateBearingCoords(route.coords[0], route.coords[1]),
+            segmentIndex: 0,
+        };
+    }
+    if (linearPosition >= route.totalLength) {
+        const n = route.coords.length;
+        return {
+            lon: route.coords[n - 1][0],
+            lat: route.coords[n - 1][1],
+            bearing: calculateBearingCoords(route.coords[n - 2], route.coords[n - 1]),
+            segmentIndex: n - 2,
+        };
+    }
+
+    // Find the segment containing this position
+    for (let i = 0; i < route.coords.length - 1; i++) {
+        if (linearPosition <= route.distances[i + 1]) {
+            const segStart = route.distances[i];
+            const segLength = route.distances[i + 1] - segStart;
+            const t = segLength > 0 ? (linearPosition - segStart) / segLength : 0;
+
+            const p1 = route.coords[i];
+            const p2 = route.coords[i + 1];
 
             return {
-                lon: last.lon + (extraDist * Math.sin(behindRad)) / metersPerDegreeLon,
-                lat: last.lat + (extraDist * Math.cos(behindRad)) / metersPerDegreeLat,
-                bearing: segBearing,
+                lon: p1[0] + (p2[0] - p1[0]) * t,
+                lat: p1[1] + (p2[1] - p1[1]) * t,
+                bearing: calculateBearingCoords(p1, p2),
+                segmentIndex: i,
             };
         }
+    }
 
-        // Ultimate fallback
-        return straightLinePositions(refLon, refLat, [targetDist], bearing)[0];
+    // Fallback (shouldn't reach here)
+    const n = route.coords.length;
+    return {
+        lon: route.coords[n - 1][0],
+        lat: route.coords[n - 1][1],
+        bearing: 0,
+        segmentIndex: n - 2,
+    };
+}
+
+/**
+ * Get positions along the route at specific distances behind a reference position
+ */
+export function getPositionsBehindOnRoute(
+    route: LinearizedRoute,
+    vehicleLinearPos: number,
+    distancesBehind: number[]
+): Array<{ lon: number; lat: number; bearing: number }> {
+    return distancesBehind.map(dist => {
+        const pos = getPositionAtDistance(route, vehicleLinearPos - dist);
+        return { lon: pos.lon, lat: pos.lat, bearing: pos.bearing };
     });
 }
 
 /**
- * Find which segment the vehicle is on, using bearing to disambiguate parallel tracks
+ * Get debug segment features for visualization
+ * Returns GeoJSON features for segments ahead (green) and behind (red)
  */
-function findVehicleSegment(
-    coords: number[][],
-    refLon: number,
-    refLat: number,
-    vehicleBearing: number
-): { segmentIndex: number; t: number } | null {
-    let best: { segmentIndex: number; t: number; score: number } | null = null;
+export function getDebugSegmentFeatures(
+    route: LinearizedRoute,
+    segmentIndex: number,
+    segmentsAhead: number,
+    segmentsBehind: number
+): GeoJSON.Feature[] {
+    const features: GeoJSON.Feature[] = [];
 
-    for (let i = 0; i < coords.length - 1; i++) {
-        const segBearing = calculateBearingCoords(coords[i], coords[i + 1]);
-
-        // Check bearing match (within 30 degrees)
-        let bearingDiff = Math.abs(segBearing - vehicleBearing);
-        if (bearingDiff > 180) bearingDiff = 360 - bearingDiff;
-        if (bearingDiff > 30) continue;
-
-        // Project point onto segment
-        const projection = projectPointOnSegment(
-            refLon, refLat,
-            coords[i][0], coords[i][1],
-            coords[i + 1][0], coords[i + 1][1]
-        );
-
-        // Score based on distance (lower is better)
-        const score = projection.distance + bearingDiff * 0.5;
-
-        if (!best || score < best.score) {
-            best = { segmentIndex: i, t: projection.t, score };
-        }
+    // Segments ahead (green)
+    for (let i = segmentIndex; i < Math.min(segmentIndex + segmentsAhead, route.coords.length - 1); i++) {
+        features.push({
+            type: "Feature",
+            properties: { color: "#00ff00", type: "ahead", index: i },
+            geometry: {
+                type: "LineString",
+                coordinates: [route.coords[i], route.coords[i + 1]],
+            },
+        });
     }
 
-    return best ? { segmentIndex: best.segmentIndex, t: best.t } : null;
+    // Segments behind (red)
+    for (let i = segmentIndex - 1; i >= Math.max(0, segmentIndex - segmentsBehind); i--) {
+        features.push({
+            type: "Feature",
+            properties: { color: "#ff0000", type: "behind", index: i },
+            geometry: {
+                type: "LineString",
+                coordinates: [route.coords[i], route.coords[i + 1]],
+            },
+        });
+    }
+
+    return features;
 }
 
 /**
@@ -525,13 +681,13 @@ function projectPointOnSegment(
     px: number, py: number,
     x1: number, y1: number,
     x2: number, y2: number
-): { t: number; distance: number } {
+): { t: number; distance: number; projLon: number; projLat: number } {
     const dx = x2 - x1;
     const dy = y2 - y1;
     const lengthSq = dx * dx + dy * dy;
 
     if (lengthSq === 0) {
-        return { t: 0, distance: haversineDistanceForTrack([px, py], [x1, y1]) };
+        return { t: 0, distance: haversineDistance([px, py], [x1, y1]), projLon: x1, projLat: y1 };
     }
 
     let t = ((px - x1) * dx + (py - y1) * dy) / lengthSq;
@@ -539,50 +695,9 @@ function projectPointOnSegment(
 
     const projLon = x1 + t * dx;
     const projLat = y1 + t * dy;
-    const distance = haversineDistanceForTrack([px, py], [projLon, projLat]);
+    const distance = haversineDistance([px, py], [projLon, projLat]);
 
-    return { t, distance };
-}
-
-/**
- * Calculate straight line positions (fallback)
- */
-function straightLinePositions(
-    refLon: number,
-    refLat: number,
-    distances: number[],
-    bearing: number
-): Array<{ lon: number; lat: number; bearing: number }> {
-    const behindRad = ((bearing + 180) * Math.PI) / 180;
-    const metersPerDegreeLat = 111320;
-    const metersPerDegreeLon = 111320 * Math.cos((refLat * Math.PI) / 180);
-
-    return distances.map(dist => {
-        if (dist === 0) {
-            return { lon: refLon, lat: refLat, bearing };
-        }
-        return {
-            lon: refLon + (dist * Math.sin(behindRad)) / metersPerDegreeLon,
-            lat: refLat + (dist * Math.cos(behindRad)) / metersPerDegreeLat,
-            bearing,
-        };
-    });
-}
-
-/**
- * Haversine distance for track calculations
- */
-function haversineDistanceForTrack(coord1: number[], coord2: number[]): number {
-    const R = 6371000;
-    const lat1 = (coord1[1] * Math.PI) / 180;
-    const lat2 = (coord2[1] * Math.PI) / 180;
-    const dLat = ((coord2[1] - coord1[1]) * Math.PI) / 180;
-    const dLon = ((coord2[0] - coord1[0]) * Math.PI) / 180;
-
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-    return R * c;
+    return { t, distance, projLon, projLat };
 }
 
 /**
@@ -612,6 +727,8 @@ export interface SmoothedVehiclePosition extends VehiclePosition {
     renderedBearing: number;
     speedMultiplier: number;
     lastUpdateTime: number;
+    // Smoothed route position (interpolated from target)
+    renderedLinearPosition?: number;
 }
 
 // Thresholds for position smoothing
@@ -655,6 +772,7 @@ export function createSmoothedPosition(target: VehiclePosition): SmoothedVehicle
         renderedBearing: target.bearing,
         speedMultiplier: 1.0,
         lastUpdateTime: Date.now(),
+        renderedLinearPosition: target.routeLinearPosition,
     };
 }
 
@@ -723,6 +841,13 @@ export function updateSmoothedPosition(
     if (bearingDiff < -180) bearingDiff += 360;
     const newBearing = (current.renderedBearing + bearingDiff * BEARING_SMOOTHING + 360) % 360;
 
+    // Smoothly interpolate linear position along route
+    let newLinearPosition = target.routeLinearPosition;
+    if (current.renderedLinearPosition !== undefined && target.routeLinearPosition !== undefined) {
+        newLinearPosition = current.renderedLinearPosition +
+            (target.routeLinearPosition - current.renderedLinearPosition) * moveFraction;
+    }
+
     return {
         ...target,
         renderedLon: newLon,
@@ -730,5 +855,6 @@ export function updateSmoothedPosition(
         renderedBearing: newBearing,
         speedMultiplier: smoothedSpeedMultiplier,
         lastUpdateTime: Date.now(),
+        renderedLinearPosition: newLinearPosition,
     };
 }
