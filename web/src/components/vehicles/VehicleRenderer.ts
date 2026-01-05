@@ -9,6 +9,7 @@ import { calculateSegmentDistances, getAugsburgVehicleModel } from "./vehicleMod
 import {
     calculateVehiclePosition,
     createSmoothedPosition,
+    findPositionOnRoute,
     getDebugSegmentFeatures,
     getPositionsBehindOnRoute,
     linearizeRoute,
@@ -35,6 +36,12 @@ export class VehicleRenderer {
     private vehicleIcons = new Set<string>();
     private animationId: number | null = null;
     private lastAnimationTime = 0;
+
+    // Current vehicles data - updated via setVehicles() so animation loop uses latest data
+    private currentVehicles: RouteVehicles[] = [];
+
+    // Current simulated time - updated via setSimulatedTime()
+    private simulatedTime: Date = new Date();
 
     private onTrackedVehicleLost?: () => void;
     private trackedTripId: string | null = null;
@@ -105,18 +112,36 @@ export class VehicleRenderer {
     }
 
     /**
-     * Start the vehicle animation loop
+     * Update the vehicles data used by the animation loop
+     * This should be called whenever vehicles prop changes
      */
-    startAnimation(vehicles: RouteVehicles[]): void {
+    setVehicles(vehicles: RouteVehicles[]): void {
+        this.currentVehicles = vehicles;
+    }
+
+    /**
+     * Update the simulated time used for vehicle position calculations
+     * This should be called whenever the simulated time changes
+     */
+    setSimulatedTime(time: Date): void {
+        this.simulatedTime = time;
+    }
+
+    /**
+     * Start the vehicle animation loop
+     * Uses this.currentVehicles which should be updated via setVehicles()
+     */
+    startAnimation(): void {
         if (this.animationId) return;
 
-        this.updatePositions(vehicles, ANIMATION_INTERVAL);
+        this.updatePositions(this.currentVehicles, ANIMATION_INTERVAL);
 
         const animate = (timestamp: number) => {
             const deltaMs = this.lastAnimationTime > 0 ? timestamp - this.lastAnimationTime : ANIMATION_INTERVAL;
             if (deltaMs >= ANIMATION_INTERVAL) {
                 this.lastAnimationTime = timestamp;
-                this.updatePositions(vehicles, deltaMs);
+                // Use this.currentVehicles so animation always uses latest data
+                this.updatePositions(this.currentVehicles, deltaMs);
             }
             this.animationId = requestAnimationFrame(animate);
         };
@@ -149,7 +174,8 @@ export class VehicleRenderer {
      * Update vehicle positions, markers, and 3D models in a single pass
      */
     updatePositions(vehicles: RouteVehicles[], deltaMs: number): void {
-        const now = new Date();
+        // Use simulated time for position calculations
+        const now = this.simulatedTime;
         const vehiclesByTripId = new globalThis.Map<string, { vehicle: RouteVehicles["vehicles"][0]; routeId: number; stopCount: number }>();
 
         for (const routeVehicles of vehicles) {
@@ -283,7 +309,8 @@ export class VehicleRenderer {
 
     /**
      * Generate 3D model features for a vehicle using linearized route
-     * Uses the linear position calculated during vehicle position interpolation (not proximity search)
+     * The 3D model position is derived from the marker position (ground truth) by projecting
+     * it onto the linearized route. This ensures the 3D model always follows the marker.
      */
     private generateModelFeatures(
         smoothedPosition: SmoothedVehiclePosition,
@@ -296,14 +323,19 @@ export class VehicleRenderer {
         const modelFeatures: GeoJSON.Feature[] = [];
         const debugFeatures: GeoJSON.Feature[] = [];
 
-        // If no linearized route or no linear position info, don't render 3D model
-        if (!linearizedRoute || smoothedPosition.renderedLinearPosition === undefined) {
+        // If no linearized route, don't render 3D model
+        if (!linearizedRoute) {
             return { modelFeatures: [], debugFeatures: [] };
         }
 
-        // Use the linear position that was calculated from the stop-to-stop interpolation
-        // This is NOT a proximity search - it comes from the actual route following logic
-        const linearPosition = smoothedPosition.renderedLinearPosition;
+        // Project the marker's rendered position onto the route to get linear position
+        // This ensures the 3D model always follows the marker (ground truth)
+        const routePosition = findPositionOnRoute(
+            linearizedRoute,
+            smoothedPosition.renderedLon,
+            smoothedPosition.renderedLat
+        );
+        const linearPosition = routePosition.linearPosition;
 
         // Get all distances behind the vehicle for 3D model segments
         const allDistances: number[] = [];
@@ -342,25 +374,12 @@ export class VehicleRenderer {
 
         // Generate debug segment visualization if this is the tracked vehicle
         if (showDebug) {
-            // Find current segment from linear position
-            const segmentIndex = this.findSegmentIndexFromLinearPosition(linearizedRoute, linearPosition);
-            const segDebug = getDebugSegmentFeatures(linearizedRoute, segmentIndex, 5, 5);
+            // Use segment index from the route projection (same source as 3D model)
+            const segDebug = getDebugSegmentFeatures(linearizedRoute, routePosition.segmentIndex, 5, 5);
             debugFeatures.push(...segDebug);
         }
 
         return { modelFeatures, debugFeatures };
-    }
-
-    /**
-     * Find segment index from a linear position along the route
-     */
-    private findSegmentIndexFromLinearPosition(route: LinearizedRoute, linearPosition: number): number {
-        for (let i = 0; i < route.distances.length - 1; i++) {
-            if (linearPosition <= route.distances[i + 1]) {
-                return i;
-            }
-        }
-        return route.coords.length - 2;
     }
 
     /**

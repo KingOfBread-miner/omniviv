@@ -1,19 +1,22 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Bug, Layers } from "lucide-react";
+import { AlertTriangle, Bug, Clock, Layers, Wifi, WifiOff } from "lucide-react";
 import { Api, Area, Route, RouteGeometry, Station, Vehicle } from "./api";
 import { OsmIssuesPanel } from "./components/IssuesPanel";
+import { TimeControlPanel } from "./components/TimeControlPanel";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
 import Map from "./components/map/Map";
 import type { DebugOptions } from "./components/vehicles/VehicleRenderer";
+import { useTimeSimulation } from "./hooks/useTimeSimulation";
+import { useVehicleUpdates, type RouteVehicles } from "./hooks/useVehicleUpdates";
 
-type SidebarPanel = "layers" | "debug" | "issues" | null;
+type SidebarPanel = "layers" | "debug" | "issues" | "time" | null;
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 const api = new Api({ baseUrl: API_URL });
 
-// How often to refresh vehicle positions (in milliseconds)
-const VEHICLE_REFRESH_INTERVAL = 5000;
+// Fallback polling interval when WebSocket is not available (in milliseconds)
+const FALLBACK_REFRESH_INTERVAL = 5000;
 
 // LocalStorage key for persisted options
 const STORAGE_KEY = "live-tram-options";
@@ -22,11 +25,11 @@ export interface RouteWithGeometry extends Route {
     geometry: RouteGeometry | null;
 }
 
-export interface RouteVehicles {
-    routeId: number;
-    lineNumber: string | null;
-    vehicles: Vehicle[];
-}
+// Re-export for use by other components
+export type { RouteVehicles } from "./hooks/useVehicleUpdates";
+
+// Local type alias for state
+type RouteVehiclesData = RouteVehicles;
 
 interface PersistedOptions {
     showAreaOutlines: boolean;
@@ -85,9 +88,12 @@ export default function App() {
     const [areas, setAreas] = useState<Area[]>([]);
     const [stations, setStations] = useState<Station[]>([]);
     const [routes, setRoutes] = useState<RouteWithGeometry[]>([]);
-    const [vehicles, setVehicles] = useState<RouteVehicles[]>([]);
+    const [vehicles, setVehicles] = useState<RouteVehiclesData[]>([]);
     const [activePanel, setActivePanel] = useState<SidebarPanel>(null);
     const [osmIssuesCount, setOsmIssuesCount] = useState<number | null>(null);
+
+    // Time simulation
+    const timeSimulation = useTimeSimulation();
 
     // Load persisted options from localStorage
     const [options, setOptions] = useState<PersistedOptions>(loadOptions);
@@ -132,12 +138,12 @@ export default function App() {
         fetchIssuesCount();
     }, []);
 
-    // Fetch vehicles for all routes
-    const fetchVehicles = useCallback(async (routeList: RouteWithGeometry[]) => {
-        if (routeList.length === 0) return;
+    // Fetch vehicles for all routes (used as fallback when WebSocket unavailable)
+    const fetchVehiclesFallback = useCallback(async () => {
+        if (routes.length === 0) return;
 
         try {
-            const vehiclePromises = routeList.map(async (route) => {
+            const vehiclePromises = routes.map(async (route) => {
                 try {
                     const response = await api.api.getVehiclesByRoute({ route_id: route.osm_id });
                     return {
@@ -159,6 +165,16 @@ export default function App() {
         } catch (err) {
             console.error("Failed to fetch vehicles:", err);
         }
+    }, [routes]);
+
+    // Handle full vehicle data from WebSocket (initial subscribe)
+    const handleFullVehicleData = useCallback((data: RouteVehiclesData[]) => {
+        setVehicles(data);
+    }, []);
+
+    // Handle incremental updates from WebSocket (only changes)
+    const handleIncrementalUpdate = useCallback((updater: (current: RouteVehiclesData[]) => RouteVehiclesData[]) => {
+        setVehicles(updater);
     }, []);
 
     // Initial data fetch
@@ -185,27 +201,27 @@ export default function App() {
                     })
                 );
                 setRoutes(routesWithGeometry);
-
-                // Initial vehicle fetch
-                await fetchVehicles(routesWithGeometry);
+                // Vehicle data will be fetched via WebSocket subscription
             } catch (err) {
                 console.error("Failed to fetch data:", err);
             }
         };
 
         fetchData();
-    }, [fetchVehicles]);
+    }, []);
 
-    // Periodic vehicle refresh
-    useEffect(() => {
-        if (routes.length === 0 || !showVehicles) return;
+    // Get route IDs for WebSocket subscription
+    const routeIds = useMemo(() => routes.map(r => r.osm_id), [routes]);
 
-        const interval = setInterval(() => {
-            fetchVehicles(routes);
-        }, VEHICLE_REFRESH_INTERVAL);
-
-        return () => clearInterval(interval);
-    }, [routes, showVehicles, fetchVehicles]);
+    // WebSocket-based vehicle updates with fallback to polling
+    const { isConnected: wsConnected, usingWebSocket } = useVehicleUpdates({
+        enabled: showVehicles && routes.length > 0,
+        routeIds,
+        onFullData: handleFullVehicleData,
+        onIncrementalUpdate: handleIncrementalUpdate,
+        onFallbackFetch: fetchVehiclesFallback,
+        fallbackInterval: FALLBACK_REFRESH_INTERVAL,
+    });
 
     return (
         <div className="h-screen w-screen relative flex">
@@ -246,6 +262,18 @@ export default function App() {
                             >
                                 {osmIssuesCount}
                             </span>
+                        )}
+                    </Button>
+                    <Button
+                        variant={activePanel === "time" ? "default" : "ghost"}
+                        size="icon"
+                        onClick={() => togglePanel("time")}
+                        className="m-2 relative"
+                        aria-label="Time Control"
+                    >
+                        <Clock className="h-5 w-5" />
+                        {!timeSimulation.isRealTime && (
+                            <span className="absolute -top-1 -right-1 bg-orange-500 text-white text-xs rounded-full h-3 w-3" />
                         )}
                     </Button>
                 </div>
@@ -310,8 +338,17 @@ export default function App() {
                                             checked={showVehicles}
                                             onCheckedChange={(checked) => updateOption("showVehicles", checked === true)}
                                         />
-                                        <span className="text-sm">
+                                        <span className="text-sm flex items-center gap-2">
                                             Show vehicles ({totalVehicleCount})
+                                            {showVehicles && (
+                                                <span title={usingWebSocket && wsConnected ? "Live updates via WebSocket" : "Polling for updates"}>
+                                                    {usingWebSocket && wsConnected ? (
+                                                        <Wifi className="h-3 w-3 text-green-500" />
+                                                    ) : (
+                                                        <WifiOff className="h-3 w-3 text-muted-foreground" />
+                                                    )}
+                                                </span>
+                                            )}
                                         </span>
                                     </label>
 
@@ -381,6 +418,10 @@ export default function App() {
                         {activePanel === "issues" && (
                             <OsmIssuesPanel />
                         )}
+
+                        {activePanel === "time" && (
+                            <TimeControlPanel timeSimulation={timeSimulation} />
+                        )}
                     </div>
                 )}
             </div>
@@ -399,6 +440,7 @@ export default function App() {
                     showRoutes={showRoutes}
                     showVehicles={showVehicles}
                     debugOptions={debugOptions}
+                    simulatedTime={timeSimulation.currentTime}
                 />
             </div>
         </div>

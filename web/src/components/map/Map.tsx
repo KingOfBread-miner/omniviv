@@ -26,6 +26,7 @@ interface MapProps {
     showRoutes: boolean;
     showVehicles: boolean;
     debugOptions: DebugOptions;
+    simulatedTime: Date;
 }
 
 interface MapState {
@@ -94,8 +95,16 @@ export default class Map extends React.Component<MapProps, MapState> {
             if (prevProps.showVehicles !== this.props.showVehicles) {
                 this.handleVehicleVisibilityChange();
             }
-            if (prevProps.vehicles !== this.props.vehicles && this.props.showVehicles) {
-                this.updateVehicles();
+            if (prevProps.vehicles !== this.props.vehicles) {
+                // Always update the vehicles reference so animation loop uses latest data
+                this.vehicleRenderer?.setVehicles(this.props.vehicles);
+                if (this.props.showVehicles) {
+                    this.updateVehicles();
+                }
+            }
+            // Update simulated time reference for vehicle position calculations
+            if (prevProps.simulatedTime !== this.props.simulatedTime) {
+                this.vehicleRenderer?.setSimulatedTime(this.props.simulatedTime);
             }
         }
 
@@ -334,7 +343,10 @@ export default class Map extends React.Component<MapProps, MapState> {
 
     private startVehicleAnimation() {
         if (!this.vehicleRenderer) return;
-        this.vehicleRenderer.startAnimation(this.props.vehicles);
+        // Set the current vehicles data and simulated time before starting animation
+        this.vehicleRenderer.setVehicles(this.props.vehicles);
+        this.vehicleRenderer.setSimulatedTime(this.props.simulatedTime);
+        this.vehicleRenderer.startAnimation();
     }
 
     private updateVehicles() {
