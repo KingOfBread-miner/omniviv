@@ -1,5 +1,71 @@
 import type { Vehicle, VehicleStop } from "../../api";
 
+// Simulated dwell time at stations (in milliseconds)
+const MIN_DWELL_TIME_MS = 20000; // 20 seconds minimum
+const MAX_DWELL_TIME_MS = 30000; // 30 seconds maximum
+
+/**
+ * Calculate the probability of stopping at a station based on time of day
+ * Early morning (5am): 95% chance
+ * Late night (midnight): 50% chance
+ * Linear interpolation between these values
+ */
+function getStopProbabilityForTime(time: Date): number {
+    const hour = time.getHours();
+    const minute = time.getMinutes();
+    const timeInHours = hour + minute / 60;
+
+    // Define the range: 5am = 95%, midnight (0 or 24) = 50%
+    // We'll use a simple linear interpolation from 5am to midnight
+    // 5am (5) -> 95%
+    // midnight (24/0) -> 50%
+
+    // Normalize time: treat 0-5am as 24-29 for continuity
+    const normalizedHour = timeInHours < 5 ? timeInHours + 24 : timeInHours;
+
+    // From 5am (5) to midnight (24), probability goes from 95% to 50%
+    // That's 19 hours, dropping 45 percentage points
+    const hoursFromMorning = normalizedHour - 5;
+    const probability = 0.95 - (hoursFromMorning / 19) * 0.45;
+
+    return Math.max(0.5, Math.min(0.95, probability));
+}
+
+/**
+ * Deterministic pseudo-random function based on trip_id and stop
+ * Returns a value between 0 and 1 that's consistent for the same inputs
+ */
+function deterministicRandom(tripId: string, stopIfopt: string): number {
+    // Simple hash function
+    const str = `${tripId}:${stopIfopt}`;
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        const char = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash; // Convert to 32bit integer
+    }
+    // Convert to 0-1 range
+    return Math.abs(hash % 10000) / 10000;
+}
+
+/**
+ * Check if a vehicle should stop at a station (for stations without explicit dwell time)
+ */
+function shouldStopAtStation(tripId: string, stopIfopt: string, currentTime: Date): boolean {
+    const probability = getStopProbabilityForTime(currentTime);
+    const random = deterministicRandom(tripId, stopIfopt);
+    return random < probability;
+}
+
+/**
+ * Get a varied dwell time for a specific stop (deterministic)
+ */
+function getDwellTimeMs(tripId: string, stopIfopt: string): number {
+    // Use a different seed by appending "dwell" to get independent randomness
+    const random = deterministicRandom(tripId, stopIfopt + ":dwell");
+    return MIN_DWELL_TIME_MS + random * (MAX_DWELL_TIME_MS - MIN_DWELL_TIME_MS);
+}
+
 export interface VehiclePosition {
     tripId: string;
     lineNumber: string;
@@ -154,9 +220,48 @@ export function calculateVehiclePosition(
             const effectiveDep = departureTime ?? arrivalTime;
 
             if (effectiveDep && nextArrival && now >= effectiveDep && now < nextArrival) {
-                prevStop = stop;
-                nextStop = nextStopData;
-                break;
+                // Check if this stop has no explicit dwell time (arrival === departure)
+                // and if we should simulate a stop based on time of day
+                const hasNoDwellTime = arrivalTime === departureTime || departureTime === null;
+
+                if (hasNoDwellTime && stop.stop_ifopt && shouldStopAtStation(vehicle.trip_id, stop.stop_ifopt, currentTime)) {
+                    // Calculate simulated dwell with varied duration
+                    const dwellTime = getDwellTimeMs(vehicle.trip_id, stop.stop_ifopt);
+                    const simulatedDepartureTime = (arrivalTime ?? effectiveDep) + dwellTime;
+
+                    if (now < simulatedDepartureTime) {
+                        // Vehicle is at the simulated stop
+                        const routePos = findLinearPositionOnRoute(stop.lon, stop.lat, routeGeometry);
+                        return {
+                            tripId: vehicle.trip_id,
+                            lineNumber: vehicle.line_number,
+                            destination: vehicle.destination,
+                            lon: stop.lon,
+                            lat: stop.lat,
+                            bearing: calculateBearing(stop, nextStopData),
+                            status: "at_stop",
+                            currentStop: stop,
+                            nextStop: nextStopData,
+                            progress: 0,
+                            delayMinutes: stop.delay_minutes ?? null,
+                            routeSegmentIndex: routePos?.segmentIndex,
+                            routeLinearPosition: routePos?.linearPosition,
+                        };
+                    }
+                    // Adjust the effective departure time for transit calculation
+                    // The vehicle will be in transit from simulatedDepartureTime to nextArrival
+                    if (now >= simulatedDepartureTime && now < nextArrival) {
+                        prevStop = stop;
+                        nextStop = nextStopData;
+                        // Store adjusted times for later calculation
+                        (prevStop as VehicleStop & { _adjustedDeparture?: number })._adjustedDeparture = simulatedDepartureTime;
+                        break;
+                    }
+                } else {
+                    prevStop = stop;
+                    nextStop = nextStopData;
+                    break;
+                }
             }
         }
 
@@ -211,7 +316,9 @@ export function calculateVehiclePosition(
 
     // Vehicle is in transit between stops
     if (prevStop && nextStop) {
-        const departureTime = getStopTime(prevStop, "departure")!;
+        // Use adjusted departure time if available (from simulated stop)
+        const adjustedDeparture = (prevStop as VehicleStop & { _adjustedDeparture?: number })._adjustedDeparture;
+        const departureTime = adjustedDeparture ?? getStopTime(prevStop, "departure")!;
         const arrivalTime = getStopTime(nextStop, "arrival")!;
         const totalTime = arrivalTime - departureTime;
         const elapsed = now - departureTime;
