@@ -1,9 +1,14 @@
+use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{broadcast, Semaphore};
+use uuid::Uuid;
+
+use crate::sync::EfaRequestLog;
 
 const EFA_BASE_URL: &str = "https://bahnland-bayern.de/efa/XML_DM_REQUEST";
 const EFA_COORD_URL: &str = "https://bahnland-bayern.de/efa/XML_COORD_REQUEST";
@@ -32,10 +37,12 @@ pub struct EfaClient {
     client: Client,
     /// Semaphore to limit concurrent requests
     rate_limiter: Arc<Semaphore>,
+    /// Sender for request diagnostics
+    diagnostics_tx: broadcast::Sender<EfaRequestLog>,
 }
 
 impl EfaClient {
-    pub fn new() -> Result<Self, EfaError> {
+    pub fn new(diagnostics_tx: broadcast::Sender<EfaRequestLog>) -> Result<Self, EfaError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -45,7 +52,14 @@ impl EfaClient {
         Ok(Self {
             client,
             rate_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            diagnostics_tx,
         })
+    }
+
+    /// Send a diagnostics log entry
+    fn log_request(&self, log: EfaRequestLog) {
+        // Ignore send errors - they just mean no one is listening
+        let _ = self.diagnostics_tx.send(log);
     }
 
     /// Fetch stop events (departures or arrivals) for a stop by its IFOPT ID
@@ -56,6 +70,19 @@ impl EfaClient {
         tram_only: bool,
         event_type: StopEventType,
     ) -> Result<DepartureResponse, EfaError> {
+        let start = Instant::now();
+        let request_id = Uuid::new_v4().to_string();
+        let endpoint = match event_type {
+            StopEventType::Departure => "XML_DM_REQUEST (departures)",
+            StopEventType::Arrival => "XML_DM_REQUEST (arrivals)",
+        };
+
+        // Build params for logging
+        let mut params = HashMap::new();
+        params.insert("stop_ifopt".to_string(), stop_ifopt.to_string());
+        params.insert("limit".to_string(), limit.to_string());
+        params.insert("tram_only".to_string(), tram_only.to_string());
+
         let mut url = format!(
             "{}?mode=direct&name_dm={}&type_dm=stop&depType=stopEvents&outputFormat=rapidJSON&limit={}&useRealtime=1",
             EFA_BASE_URL,
@@ -73,34 +100,99 @@ impl EfaClient {
             StopEventType::Arrival => url.push_str("&itdDateTimeDepArr=arr"),
         }
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| EfaError::NetworkError(e.to_string()))?;
+        let response = match self.client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.log_request(EfaRequestLog {
+                    id: request_id,
+                    timestamp: Utc::now().to_rfc3339(),
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    params: Some(params),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    status: 0,
+                    response_size: None,
+                    error: Some(e.to_string()),
+                });
+                return Err(EfaError::NetworkError(e.to_string()));
+            }
+        };
+
+        let status = response.status().as_u16();
 
         if !response.status().is_success() {
-            return Err(EfaError::ApiError(format!(
-                "HTTP error: {}",
-                response.status()
-            )));
+            self.log_request(EfaRequestLog {
+                id: request_id,
+                timestamp: Utc::now().to_rfc3339(),
+                method: "GET".to_string(),
+                endpoint: endpoint.to_string(),
+                params: Some(params),
+                duration_ms: start.elapsed().as_millis() as u64,
+                status,
+                response_size: None,
+                error: Some(format!("HTTP error: {}", status)),
+            });
+            return Err(EfaError::ApiError(format!("HTTP error: {}", status)));
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| EfaError::NetworkError(e.to_string()))?;
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                self.log_request(EfaRequestLog {
+                    id: request_id,
+                    timestamp: Utc::now().to_rfc3339(),
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    params: Some(params),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    status,
+                    response_size: None,
+                    error: Some(format!("Failed to read body: {}", e)),
+                });
+                return Err(EfaError::NetworkError(e.to_string()));
+            }
+        };
 
-        serde_json::from_str(&body).map_err(|e| {
-            tracing::warn!(
-                "Failed to parse EFA response for {}: {} - body: {}",
-                stop_ifopt,
-                e,
-                &body[..body.len().min(500)]
-            );
-            EfaError::ParseError(e.to_string())
-        })
+        let response_size = body.len();
+
+        let result: Result<DepartureResponse, _> = serde_json::from_str(&body);
+
+        match &result {
+            Ok(_) => {
+                self.log_request(EfaRequestLog {
+                    id: request_id,
+                    timestamp: Utc::now().to_rfc3339(),
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    params: Some(params),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    status,
+                    response_size: Some(response_size),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse EFA response for {}: {} - body: {}",
+                    stop_ifopt,
+                    e,
+                    &body[..body.len().min(500)]
+                );
+                self.log_request(EfaRequestLog {
+                    id: request_id,
+                    timestamp: Utc::now().to_rfc3339(),
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    params: Some(params),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    status,
+                    response_size: Some(response_size),
+                    error: Some(format!("Parse error: {}", e)),
+                });
+            }
+        }
+
+        result.map_err(|e| EfaError::ParseError(e.to_string()))
     }
 
     /// Fetch departures for a stop by its IFOPT ID (e.g., "de:09761:101")
@@ -184,38 +276,111 @@ impl EfaClient {
         lat: f64,
         radius_meters: u32,
     ) -> Result<CoordSearchResponse, EfaError> {
+        let start = Instant::now();
+        let request_id = Uuid::new_v4().to_string();
+        let endpoint = "XML_COORD_REQUEST";
+
+        let mut params = HashMap::new();
+        params.insert("lon".to_string(), lon.to_string());
+        params.insert("lat".to_string(), lat.to_string());
+        params.insert("radius".to_string(), radius_meters.to_string());
+
         let url = format!(
             "{}?outputFormat=rapidJSON&coord={}:{}:WGS84&inclFilter=1&type_1=STOP&radius_1={}",
             EFA_COORD_URL, lon, lat, radius_meters
         );
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| EfaError::NetworkError(e.to_string()))?;
+        let response = match self.client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.log_request(EfaRequestLog {
+                    id: request_id,
+                    timestamp: Utc::now().to_rfc3339(),
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    params: Some(params),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    status: 0,
+                    response_size: None,
+                    error: Some(e.to_string()),
+                });
+                return Err(EfaError::NetworkError(e.to_string()));
+            }
+        };
+
+        let status = response.status().as_u16();
 
         if !response.status().is_success() {
-            return Err(EfaError::ApiError(format!(
-                "HTTP error: {}",
-                response.status()
-            )));
+            self.log_request(EfaRequestLog {
+                id: request_id,
+                timestamp: Utc::now().to_rfc3339(),
+                method: "GET".to_string(),
+                endpoint: endpoint.to_string(),
+                params: Some(params),
+                duration_ms: start.elapsed().as_millis() as u64,
+                status,
+                response_size: None,
+                error: Some(format!("HTTP error: {}", status)),
+            });
+            return Err(EfaError::ApiError(format!("HTTP error: {}", status)));
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| EfaError::NetworkError(e.to_string()))?;
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                self.log_request(EfaRequestLog {
+                    id: request_id,
+                    timestamp: Utc::now().to_rfc3339(),
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    params: Some(params),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    status,
+                    response_size: None,
+                    error: Some(format!("Failed to read body: {}", e)),
+                });
+                return Err(EfaError::NetworkError(e.to_string()));
+            }
+        };
 
-        serde_json::from_str(&body).map_err(|e| {
-            tracing::warn!(
-                "Failed to parse EFA coord response: {} - body: {}",
-                e,
-                &body[..body.len().min(500)]
-            );
-            EfaError::ParseError(e.to_string())
-        })
+        let response_size = body.len();
+        let result: Result<CoordSearchResponse, _> = serde_json::from_str(&body);
+
+        match &result {
+            Ok(_) => {
+                self.log_request(EfaRequestLog {
+                    id: request_id,
+                    timestamp: Utc::now().to_rfc3339(),
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    params: Some(params),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    status,
+                    response_size: Some(response_size),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse EFA coord response: {} - body: {}",
+                    e,
+                    &body[..body.len().min(500)]
+                );
+                self.log_request(EfaRequestLog {
+                    id: request_id,
+                    timestamp: Utc::now().to_rfc3339(),
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    params: Some(params),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    status,
+                    response_size: Some(response_size),
+                    error: Some(format!("Parse error: {}", e)),
+                });
+            }
+        }
+
+        result.map_err(|e| EfaError::ParseError(e.to_string()))
     }
 
     /// Get all platforms for a station by querying departures

@@ -8,12 +8,13 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use tokio::sync::broadcast;
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
 
 use super::vehicles::{Vehicle, VehicleStop};
-use crate::sync::{DepartureStore, EventType, VehicleUpdateSender};
+use crate::sync::{DepartureStore, EfaRequestSender, EventType, VehicleUpdateSender};
 
 #[derive(Clone)]
 pub struct WsState {
@@ -467,4 +468,162 @@ async fn build_vehicle_data(
     }
 
     Ok(results)
+}
+
+// ============================================================================
+// Backend Diagnostics WebSocket
+// ============================================================================
+
+use std::time::Instant;
+
+/// Rolling window for tracking request statistics
+struct RequestStats {
+    /// Timestamps and durations of recent requests (last 60 seconds)
+    recent_requests: VecDeque<(Instant, u64, bool)>, // (timestamp, duration_ms, is_error)
+}
+
+impl RequestStats {
+    fn new() -> Self {
+        Self {
+            recent_requests: VecDeque::new(),
+        }
+    }
+
+    fn record(&mut self, duration_ms: u64, is_error: bool) {
+        let now = Instant::now();
+        self.recent_requests.push_back((now, duration_ms, is_error));
+        self.cleanup();
+    }
+
+    fn cleanup(&mut self) {
+        let cutoff = Instant::now() - std::time::Duration::from_secs(60);
+        while let Some((ts, _, _)) = self.recent_requests.front() {
+            if *ts < cutoff {
+                self.recent_requests.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn get_stats(&mut self) -> (u32, f64, u32) {
+        self.cleanup();
+
+        let total = self.recent_requests.len() as u32;
+        let errors = self.recent_requests.iter().filter(|(_, _, e)| *e).count() as u32;
+
+        let avg_latency = if total > 0 {
+            let sum: u64 = self.recent_requests.iter().map(|(_, d, _)| *d).sum();
+            sum as f64 / total as f64
+        } else {
+            0.0
+        };
+
+        (total, avg_latency, errors)
+    }
+}
+
+/// State for backend diagnostics WebSocket
+#[derive(Clone)]
+pub struct DiagnosticsWsState {
+    stats: Arc<RwLock<RequestStats>>,
+}
+
+impl DiagnosticsWsState {
+    pub fn new(efa_requests_tx: EfaRequestSender) -> Self {
+        let stats = Arc::new(RwLock::new(RequestStats::new()));
+
+        // Spawn a task to collect statistics from EFA requests
+        let stats_clone = stats.clone();
+        let mut rx = efa_requests_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(log) => {
+                        let mut stats = stats_clone.write().await;
+                        stats.record(log.duration_ms, log.error.is_some());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+
+        Self { stats }
+    }
+}
+
+/// EFA API statistics
+#[derive(Debug, Serialize)]
+struct EfaStats {
+    /// Requests in the last 60 seconds
+    requests_per_minute: u32,
+    /// Average latency in milliseconds
+    avg_latency_ms: f64,
+    /// Number of errors in the last 60 seconds
+    errors_per_minute: u32,
+}
+
+/// Server message for backend diagnostics
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticsServerMessage {
+    /// Periodic statistics update
+    Stats { efa: EfaStats },
+}
+
+/// WebSocket endpoint for backend diagnostics
+pub async fn ws_backend_diagnostics(
+    ws: WebSocketUpgrade,
+    State(state): State<DiagnosticsWsState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_diagnostics_socket(socket, state))
+}
+
+async fn handle_diagnostics_socket(socket: WebSocket, state: DiagnosticsWsState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // Send stats every second
+    let stats = state.stats.clone();
+    let forward_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+
+        loop {
+            interval.tick().await;
+
+            let (requests_per_minute, avg_latency_ms, errors_per_minute) = {
+                let mut stats = stats.write().await;
+                stats.get_stats()
+            };
+
+            let msg = DiagnosticsServerMessage::Stats {
+                efa: EfaStats {
+                    requests_per_minute,
+                    avg_latency_ms,
+                    errors_per_minute,
+                },
+            };
+
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if sender.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Handle incoming messages (just wait for close)
+    while let Some(msg) = receiver.next().await {
+        match msg {
+            Ok(Message::Ping(_)) => {
+                // Axum handles pong automatically
+            }
+            Ok(Message::Close(_)) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    forward_task.abort();
 }

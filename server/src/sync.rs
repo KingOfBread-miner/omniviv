@@ -62,6 +62,32 @@ pub struct VehicleUpdate {
 /// Sender for vehicle update notifications
 pub type VehicleUpdateSender = broadcast::Sender<VehicleUpdate>;
 
+/// EFA API request log for diagnostics
+#[derive(Debug, Clone, Serialize)]
+pub struct EfaRequestLog {
+    /// Unique request ID
+    pub id: String,
+    /// Timestamp when request was made
+    pub timestamp: String,
+    /// HTTP method (GET, POST)
+    pub method: String,
+    /// API endpoint called
+    pub endpoint: String,
+    /// Request parameters
+    pub params: Option<std::collections::HashMap<String, String>>,
+    /// Duration of request in milliseconds
+    pub duration_ms: u64,
+    /// HTTP status code
+    pub status: u16,
+    /// Response size in bytes
+    pub response_size: Option<usize>,
+    /// Error message if request failed
+    pub error: Option<String>,
+}
+
+/// Sender for EFA request diagnostics
+pub type EfaRequestSender = broadcast::Sender<EfaRequestLog>;
+
 /// Types of OSM data quality issues
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -233,12 +259,18 @@ pub struct SyncManager {
     departures: DepartureStore,
     issues: OsmIssueStore,
     vehicle_updates_tx: VehicleUpdateSender,
+    efa_requests_tx: EfaRequestSender,
 }
 
 impl SyncManager {
     pub fn new(pool: SqlitePool, config: Config) -> Result<Self, SyncError> {
         let osm_client = OsmClient::new().map_err(|e| SyncError::OsmError(e.to_string()))?;
-        let efa_client = EfaClient::new().map_err(|e| SyncError::EfaError(e.to_string()))?;
+
+        // Create broadcast channel for EFA request diagnostics (capacity 100)
+        let (efa_requests_tx, _) = broadcast::channel(100);
+
+        let efa_client = EfaClient::new(efa_requests_tx.clone())
+            .map_err(|e| SyncError::EfaError(e.to_string()))?;
 
         // Create broadcast channel for vehicle updates (capacity 16 - clients will get latest state anyway)
         let (vehicle_updates_tx, _) = broadcast::channel(16);
@@ -251,6 +283,7 @@ impl SyncManager {
             departures: Arc::new(RwLock::new(HashMap::new())),
             issues: Arc::new(RwLock::new(Vec::new())),
             vehicle_updates_tx,
+            efa_requests_tx,
         })
     }
 
@@ -267,6 +300,11 @@ impl SyncManager {
     /// Get the vehicle updates sender for passing to API handlers
     pub fn vehicle_updates_sender(&self) -> VehicleUpdateSender {
         self.vehicle_updates_tx.clone()
+    }
+
+    /// Get the EFA request sender for passing to diagnostics WebSocket
+    pub fn efa_requests_sender(&self) -> EfaRequestSender {
+        self.efa_requests_tx.clone()
     }
 
     /// Start the background sync loops
