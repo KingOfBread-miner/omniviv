@@ -1,70 +1,5 @@
 import type { Vehicle, VehicleStop } from "../../api";
-
-// Simulated dwell time at stations (in milliseconds)
-const MIN_DWELL_TIME_MS = 20000; // 20 seconds minimum
-const MAX_DWELL_TIME_MS = 30000; // 30 seconds maximum
-
-/**
- * Calculate the probability of stopping at a station based on time of day
- * Early morning (5am): 95% chance
- * Late night (midnight): 50% chance
- * Linear interpolation between these values
- */
-function getStopProbabilityForTime(time: Date): number {
-    const hour = time.getHours();
-    const minute = time.getMinutes();
-    const timeInHours = hour + minute / 60;
-
-    // Define the range: 5am = 95%, midnight (0 or 24) = 50%
-    // We'll use a simple linear interpolation from 5am to midnight
-    // 5am (5) -> 95%
-    // midnight (24/0) -> 50%
-
-    // Normalize time: treat 0-5am as 24-29 for continuity
-    const normalizedHour = timeInHours < 5 ? timeInHours + 24 : timeInHours;
-
-    // From 5am (5) to midnight (24), probability goes from 95% to 50%
-    // That's 19 hours, dropping 45 percentage points
-    const hoursFromMorning = normalizedHour - 5;
-    const probability = 0.95 - (hoursFromMorning / 19) * 0.45;
-
-    return Math.max(0.5, Math.min(0.95, probability));
-}
-
-/**
- * Deterministic pseudo-random function based on trip_id and stop
- * Returns a value between 0 and 1 that's consistent for the same inputs
- */
-function deterministicRandom(tripId: string, stopIfopt: string): number {
-    // Simple hash function
-    const str = `${tripId}:${stopIfopt}`;
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32bit integer
-    }
-    // Convert to 0-1 range
-    return Math.abs(hash % 10000) / 10000;
-}
-
-/**
- * Check if a vehicle should stop at a station (for stations without explicit dwell time)
- */
-function shouldStopAtStation(tripId: string, stopIfopt: string, currentTime: Date): boolean {
-    const probability = getStopProbabilityForTime(currentTime);
-    const random = deterministicRandom(tripId, stopIfopt);
-    return random < probability;
-}
-
-/**
- * Get a varied dwell time for a specific stop (deterministic)
- */
-function getDwellTimeMs(tripId: string, stopIfopt: string): number {
-    // Use a different seed by appending "dwell" to get independent randomness
-    const random = deterministicRandom(tripId, stopIfopt + ":dwell");
-    return MIN_DWELL_TIME_MS + random * (MAX_DWELL_TIME_MS - MIN_DWELL_TIME_MS);
-}
+import { featureManager, shouldStopAtStation, getDwellTimeMs } from "./features";
 
 export interface VehiclePosition {
     tripId: string;
@@ -221,10 +156,11 @@ export function calculateVehiclePosition(
 
             if (effectiveDep && nextArrival && now >= effectiveDep && now < nextArrival) {
                 // Check if this stop has no explicit dwell time (arrival === departure)
-                // and if we should simulate a stop based on time of day
+                // and if we should simulate a stop based on time of day (if feature enabled)
                 const hasNoDwellTime = arrivalTime === departureTime || departureTime === null;
+                const simulatedStopsEnabled = featureManager.isEnabled("simulated-stops");
 
-                if (hasNoDwellTime && stop.stop_ifopt && shouldStopAtStation(vehicle.trip_id, stop.stop_ifopt, currentTime)) {
+                if (simulatedStopsEnabled && hasNoDwellTime && stop.stop_ifopt && shouldStopAtStation(vehicle.trip_id, stop.stop_ifopt, currentTime)) {
                     // Calculate simulated dwell with varied duration
                     const dwellTime = getDwellTimeMs(vehicle.trip_id, stop.stop_ifopt);
                     const simulatedDepartureTime = (arrivalTime ?? effectiveDep) + dwellTime;
@@ -322,7 +258,10 @@ export function calculateVehiclePosition(
         const arrivalTime = getStopTime(nextStop, "arrival")!;
         const totalTime = arrivalTime - departureTime;
         const elapsed = now - departureTime;
-        const progress = Math.min(1, Math.max(0, elapsed / totalTime));
+        const linearProgress = Math.min(1, Math.max(0, elapsed / totalTime));
+
+        // Apply easing for realistic acceleration/deceleration
+        const progress = easeInOutProgress(linearProgress);
 
         // Interpolate position along route geometry
         const position = interpolatePositionAlongRoute(
@@ -339,10 +278,10 @@ export function calculateVehiclePosition(
             lon: position.lon,
             lat: position.lat,
             bearing: position.bearing,
-            status: progress > 0.8 ? "approaching" : "in_transit",
+            status: linearProgress > 0.8 ? "approaching" : "in_transit",
             currentStop: prevStop,
             nextStop: nextStop,
-            progress,
+            progress: linearProgress, // Use linear progress for external tracking
             delayMinutes: prevStop.delay_minutes ?? nextStop.delay_minutes ?? null,
             routeSegmentIndex: position.segmentIndex,
             routeLinearPosition: position.linearPosition,
@@ -809,19 +748,34 @@ function projectPointOnSegment(
 
 /**
  * Apply easing for smooth acceleration/deceleration near stops
+ * Uses a cubic ease-in-out curve for realistic train/tram movement
+ *
+ * The curve has three phases:
+ * 1. Acceleration (0-5% of journey): Gradual speed increase from standstill
+ * 2. Cruising (5-95% of journey): Constant speed
+ * 3. Deceleration (95-100% of journey): Gradual speed decrease to stop
  */
 export function easeInOutProgress(progress: number): number {
-    // Ease in/out curve: slow at start and end, fast in middle
-    if (progress < 0.1) {
-        // Accelerating from stop
-        return progress * progress * 50; // 0 to 0.5
-    } else if (progress > 0.9) {
-        // Decelerating to stop
-        const p = 1 - progress;
-        return 1 - p * p * 50; // 0.5 to 1
+    const accelEnd = 0.05;    // End of acceleration phase
+    const decelStart = 0.95;  // Start of deceleration phase
+
+    if (progress <= 0) return 0;
+    if (progress >= 1) return 1;
+
+    if (progress < accelEnd) {
+        // Acceleration phase: cubic ease-in
+        // Maps 0-0.15 to 0-0.15 with smooth start
+        const t = progress / accelEnd;
+        return accelEnd * (t * t * (3 - 2 * t));
+    } else if (progress > decelStart) {
+        // Deceleration phase: cubic ease-out
+        // Maps 0.85-1 to 0.85-1 with smooth end
+        const t = (progress - decelStart) / (1 - decelStart);
+        const eased = t * t * (3 - 2 * t);
+        return decelStart + (1 - decelStart) * eased;
     } else {
-        // Cruising
-        return 0.5 + (progress - 0.5);
+        // Cruising phase: linear
+        return progress;
     }
 }
 

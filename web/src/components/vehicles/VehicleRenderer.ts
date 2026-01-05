@@ -11,6 +11,7 @@ import {
     createSmoothedPosition,
     findPositionOnRoute,
     getDebugSegmentFeatures,
+    getPositionAtDistance,
     getPositionsBehindOnRoute,
     linearizeRoute,
     updateSmoothedPosition,
@@ -18,6 +19,7 @@ import {
     type SmoothedVehiclePosition,
     type VehiclePosition,
 } from "./vehicleUtils";
+import { featureManager, type VehicleRenderContext, type RenderPosition } from "./features";
 
 const ANIMATION_INTERVAL = 50;
 
@@ -232,6 +234,50 @@ export class VehicleRenderer {
                 smoothedPosition = createSmoothedPosition(targetPosition);
             }
             this.smoothedPositions.set(targetPosition.tripId, smoothedPosition);
+        }
+
+        // Collect vehicle context for feature processing
+        const vehicleContexts: VehicleRenderContext[] = [];
+        for (const { position: targetPosition, routeId } of allPositions) {
+            if (!activeTripIds.has(targetPosition.tripId)) continue;
+
+            const smoothedPosition = this.smoothedPositions.get(targetPosition.tripId);
+            if (!smoothedPosition) continue;
+
+            // Get linear position from rendered position
+            const linearizedRoute = this.linearizedRoutes.get(routeId);
+            if (!linearizedRoute) continue;
+
+            const routePosition = findPositionOnRoute(
+                linearizedRoute,
+                smoothedPosition.renderedLon,
+                smoothedPosition.renderedLat
+            );
+
+            vehicleContexts.push({
+                tripId: targetPosition.tripId,
+                routeId,
+                linearPosition: routePosition.linearPosition,
+                smoothedPosition,
+            });
+        }
+
+        // Process render positions through feature pipeline
+        const renderPositions = this.processRenderPositions(vehicleContexts);
+
+        // Now generate features using processed render positions
+        for (const { position: targetPosition, routeId, routeColor } of allPositions) {
+            if (!activeTripIds.has(targetPosition.tripId)) continue;
+
+            const smoothedPosition = this.smoothedPositions.get(targetPosition.tripId);
+            if (!smoothedPosition) continue;
+
+            // Get processed render position (or fall back to smoothed)
+            const renderPos = renderPositions.get(targetPosition.tripId) ?? {
+                lon: smoothedPosition.renderedLon,
+                lat: smoothedPosition.renderedLat,
+                bearing: smoothedPosition.renderedBearing,
+            };
 
             // Create vehicle marker icon
             const lineNum = smoothedPosition.lineNumber ?? "?";
@@ -251,13 +297,13 @@ export class VehicleRenderer {
                     destination: smoothedPosition.destination,
                     status: smoothedPosition.status,
                     delayMinutes: smoothedPosition.delayMinutes,
-                    bearing: smoothedPosition.renderedBearing,
+                    bearing: renderPos.bearing,
                     color: routeColor,
                     iconId,
                     currentStopName: smoothedPosition.currentStop?.stop_name ?? null,
                     nextStopName: smoothedPosition.nextStop?.stop_name ?? null,
                 },
-                geometry: { type: "Point", coordinates: [smoothedPosition.renderedLon, smoothedPosition.renderedLat] },
+                geometry: { type: "Point", coordinates: [renderPos.lon, renderPos.lat] },
             });
 
             // Generate 3D model features and debug visualization
@@ -272,6 +318,7 @@ export class VehicleRenderer {
             if (this.debugOptions.show3DModels || showDebugForThis) {
                 const { modelFeatures: segmentFeatures, debugFeatures: segDebugFeatures } = this.generateModelFeatures(
                     smoothedPosition,
+                    renderPos,
                     linearizedRoute,
                     routeColor,
                     vehicleModel,
@@ -309,11 +356,11 @@ export class VehicleRenderer {
 
     /**
      * Generate 3D model features for a vehicle using linearized route
-     * The 3D model position is derived from the marker position (ground truth) by projecting
-     * it onto the linearized route. This ensures the 3D model always follows the marker.
+     * The 3D model position is derived from the render position (after collision avoidance)
      */
     private generateModelFeatures(
         smoothedPosition: SmoothedVehiclePosition,
+        renderPos: { lon: number; lat: number; bearing: number },
         linearizedRoute: LinearizedRoute | undefined,
         routeColor: string,
         vehicleModel: ReturnType<typeof getAugsburgVehicleModel>,
@@ -328,12 +375,11 @@ export class VehicleRenderer {
             return { modelFeatures: [], debugFeatures: [] };
         }
 
-        // Project the marker's rendered position onto the route to get linear position
-        // This ensures the 3D model always follows the marker (ground truth)
+        // Project the render position onto the route to get linear position
         const routePosition = findPositionOnRoute(
             linearizedRoute,
-            smoothedPosition.renderedLon,
-            smoothedPosition.renderedLat
+            renderPos.lon,
+            renderPos.lat
         );
         const linearPosition = routePosition.linearPosition;
 
@@ -413,6 +459,30 @@ export class VehicleRenderer {
         ];
         corners.push(corners[0]);
         return corners;
+    }
+
+    /**
+     * Process render positions through feature pipeline
+     * Returns a map of tripId -> {lon, lat, bearing} for rendering
+     */
+    private processRenderPositions(vehicleContexts: VehicleRenderContext[]): globalThis.Map<string, RenderPosition> {
+        const renderPositions = new globalThis.Map<string, RenderPosition>();
+
+        if (vehicleContexts.length === 0) return renderPositions;
+
+        // Initialize render positions from smoothed positions
+        for (const vehicle of vehicleContexts) {
+            renderPositions.set(vehicle.tripId, {
+                lon: vehicle.smoothedPosition.renderedLon,
+                lat: vehicle.smoothedPosition.renderedLat,
+                bearing: vehicle.smoothedPosition.renderedBearing,
+            });
+        }
+
+        // Process through all enabled features
+        featureManager.processRenderPositions(vehicleContexts, renderPositions, this.linearizedRoutes);
+
+        return renderPositions;
     }
 
     /**
