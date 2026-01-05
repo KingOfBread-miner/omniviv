@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Bug, Clock, Layers, Wifi, WifiOff } from "lucide-react";
+import { AlertTriangle, Bug, Clock, Layers, Moon, Navigation, Sun, Wifi, WifiOff } from "lucide-react";
 import { Api, Area, Route, RouteGeometry, Station, Vehicle } from "./api";
 import { OsmIssuesPanel } from "./components/IssuesPanel";
+import { NavigationPanel } from "./components/NavigationPanel";
 import { TimeControlPanel } from "./components/TimeControlPanel";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
@@ -10,7 +11,7 @@ import type { DebugOptions } from "./components/vehicles/VehicleRenderer";
 import { useTimeSimulation } from "./hooks/useTimeSimulation";
 import { useVehicleUpdates, type RouteVehicles } from "./hooks/useVehicleUpdates";
 
-type SidebarPanel = "layers" | "debug" | "issues" | "time" | null;
+type SidebarPanel = "navigation" | "layers" | "debug" | "issues" | "time" | null;
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 const api = new Api({ baseUrl: API_URL });
@@ -91,6 +92,18 @@ export default function App() {
     const [vehicles, setVehicles] = useState<RouteVehiclesData[]>([]);
     const [activePanel, setActivePanel] = useState<SidebarPanel>(null);
     const [osmIssuesCount, setOsmIssuesCount] = useState<number | null>(null);
+
+    // Theme state
+    const [isDark, setIsDark] = useState(() => {
+        const stored = localStorage.getItem("theme");
+        if (stored) return stored === "dark";
+        return window.matchMedia("(prefers-color-scheme: dark)").matches;
+    });
+
+    useEffect(() => {
+        document.documentElement.classList.toggle("dark", isDark);
+        localStorage.setItem("theme", isDark ? "dark" : "light");
+    }, [isDark]);
 
     // Time simulation
     const timeSimulation = useTimeSimulation();
@@ -230,6 +243,15 @@ export default function App() {
                 {/* Icon bar */}
                 <div className="flex flex-col bg-background border-r shadow-lg">
                     <Button
+                        variant={activePanel === "navigation" ? "default" : "ghost"}
+                        size="icon"
+                        onClick={() => togglePanel("navigation")}
+                        className="m-2"
+                        aria-label="Route Planning"
+                    >
+                        <Navigation className="h-5 w-5" />
+                    </Button>
+                    <Button
                         variant={activePanel === "layers" ? "default" : "ghost"}
                         size="icon"
                         onClick={() => togglePanel("layers")}
@@ -276,11 +298,25 @@ export default function App() {
                             <span className="absolute -top-1 -right-1 bg-orange-500 text-white text-xs rounded-full h-3 w-3" />
                         )}
                     </Button>
+                    <div className="flex-1" />
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => setIsDark(!isDark)}
+                        className="m-2"
+                        aria-label="Toggle theme"
+                    >
+                        {isDark ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+                    </Button>
                 </div>
 
                 {/* Content panel */}
                 {activePanel && (
                     <div className="w-80 h-full bg-background border-r shadow-lg overflow-y-auto">
+                        {activePanel === "navigation" && (
+                            <NavigationPanel stations={stations} />
+                        )}
+
                         {activePanel === "layers" && (
                             <div className="p-4">
                                 <h2 className="font-semibold mb-4">Layers</h2>

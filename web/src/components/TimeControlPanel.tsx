@@ -2,6 +2,7 @@ import { Pause, Play, RotateCcw } from "lucide-react";
 import type { UseTimeSimulationResult } from "../hooks/useTimeSimulation";
 import { Button } from "./ui/button";
 import { DateTimePicker } from "./ui/date-time-picker";
+import { Slider } from "./ui/slider";
 
 interface TimeControlPanelProps {
     timeSimulation: UseTimeSimulationResult;
@@ -29,8 +30,8 @@ const dateFormatter = new Intl.DateTimeFormat(undefined, {
 export function TimeControlPanel({ timeSimulation }: TimeControlPanelProps) {
     const { currentTime, speed, isRealTime, setTime, setSpeed, resetToRealTime, pause, resume } = timeSimulation;
 
-    const handleSpeedChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        setSpeed(Number(e.target.value));
+    const handleSpeedChange = (value: number[]) => {
+        setSpeed(value[0]);
     };
 
     const getSpeedLabel = (s: number) => {
@@ -96,13 +97,12 @@ export function TimeControlPanel({ timeSimulation }: TimeControlPanelProps) {
                             {getSpeedLabel(speed)}
                         </span>
                     </div>
-                    <input
-                        type="range"
+                    <Slider
                         min={MIN_SPEED}
                         max={MAX_SPEED}
-                        value={speed}
-                        onChange={handleSpeedChange}
-                        className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer accent-primary"
+                        step={1}
+                        value={[speed]}
+                        onValueChange={handleSpeedChange}
                     />
                     <div className="flex justify-between mt-1">
                         {SPEED_PRESETS.map(preset => (

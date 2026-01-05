@@ -176,9 +176,15 @@ button {
 
 /* Custom popup container styling */
 .map-popup {
-    background: white;
+    background: oklch(1 0 0);
+    color: oklch(0.145 0 0);
     border-radius: 0.5rem;
     box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+}
+
+.dark .map-popup {
+    background: oklch(0.2 0 0);
+    color: oklch(0.99 0 0);
 }
 
 /* Popup close button styling */
@@ -196,7 +202,20 @@ button {
     color: #374151;
 }
 
+.dark .maplibregl-popup-close-button {
+    color: #9ca3af;
+}
+
+.dark .maplibregl-popup-close-button:hover {
+    background: #374151;
+    color: #e5e7eb;
+}
+
 /* Keep the popup tip/arrow styled */
 .maplibregl-popup-tip {
-    border-top-color: white !important;
+    border-top-color: oklch(1 0 0) !important;
+}
+
+.dark .maplibregl-popup-tip {
+    border-top-color: oklch(0.2 0 0) !important;
 }
