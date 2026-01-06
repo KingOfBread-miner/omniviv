@@ -22,6 +22,12 @@ interface NavigationLocation {
     lon: number;
 }
 
+interface HighlightedBuilding {
+    lat: number;
+    lon: number;
+    color?: string;
+}
+
 interface MapProps {
     areas: Area[];
     stations: Station[];
@@ -41,6 +47,8 @@ interface MapProps {
     onCancelPickMode?: () => void;
     navigationStart?: NavigationLocation | null;
     navigationEnd?: NavigationLocation | null;
+    highlightedBuilding?: HighlightedBuilding | null;
+    onHighlightBuilding?: (building: HighlightedBuilding | null) => void;
 }
 
 interface ContextMenuState {
@@ -63,6 +71,7 @@ interface MapState {
     trackingInfo: TrackingInfo | null;
     contextMenu: ContextMenuState | null;
     measurement: MeasurementState;
+    buildingHighlighted: boolean;
 }
 
 export default class Map extends React.Component<MapProps, MapState> {
@@ -93,6 +102,7 @@ export default class Map extends React.Component<MapProps, MapState> {
                 endPoint: null,
                 isActive: false,
             },
+            buildingHighlighted: false,
         };
     }
 
@@ -170,6 +180,15 @@ export default class Map extends React.Component<MapProps, MapState> {
         if (prevProps.navigationStart !== this.props.navigationStart ||
             prevProps.navigationEnd !== this.props.navigationEnd) {
             this.updateNavigationPointsLayer();
+        }
+
+        // Update highlighted building
+        if (prevProps.highlightedBuilding !== this.props.highlightedBuilding) {
+            // Reset cached geometry when coordinates change
+            this.highlightedBuildingGeometry = null;
+            this.setState({ buildingHighlighted: false }, () => {
+                this.updateHighlightedBuilding();
+            });
         }
     }
 
@@ -317,6 +336,20 @@ export default class Map extends React.Component<MapProps, MapState> {
 
             this.setupMapEventHandlers();
             this.setState({ mapLoaded: true });
+
+            // Re-apply highlighted building when map moves (tiles may load)
+            this.map.on("moveend", () => {
+                if (this.props.highlightedBuilding && !this.state.buildingHighlighted) {
+                    this.updateHighlightedBuilding();
+                }
+            });
+
+            // Also try on sourcedata events when new tiles load
+            this.map.on("sourcedata", (e) => {
+                if (e.sourceId === "openmaptiles" && e.isSourceLoaded && this.props.highlightedBuilding && !this.state.buildingHighlighted) {
+                    this.updateHighlightedBuilding();
+                }
+            });
         });
     }
 
@@ -449,6 +482,24 @@ export default class Map extends React.Component<MapProps, MapState> {
         this.closeContextMenu();
     };
 
+    private highlightBuildingAtPoint = () => {
+        const { contextMenu } = this.state;
+        if (!contextMenu || !this.props.onHighlightBuilding) return;
+
+        this.props.onHighlightBuilding({
+            lat: contextMenu.lat,
+            lon: contextMenu.lng,
+        });
+        this.closeContextMenu();
+    };
+
+    private clearHighlightedBuilding = () => {
+        if (this.props.onHighlightBuilding) {
+            this.props.onHighlightBuilding(null);
+        }
+        this.closeContextMenu();
+    };
+
     private startMeasurement = () => {
         const { contextMenu } = this.state;
         if (!contextMenu) return;
@@ -527,6 +578,192 @@ export default class Map extends React.Component<MapProps, MapState> {
             return `${meters.toFixed(0)} m`;
         }
         return `${(meters / 1000).toFixed(2)} km`;
+    }
+
+    private highlightedBuildingGeometry: GeoJSON.Feature | null = null;
+
+    private updateHighlightedBuilding() {
+        if (!this.map) return;
+
+        const { highlightedBuilding } = this.props;
+        const sourceId = "highlighted-building";
+        const layerId = "highlighted-building-3d";
+
+        // If no building to highlight, clear everything
+        if (!highlightedBuilding) {
+            if (this.map.getLayer(layerId)) {
+                this.map.removeLayer(layerId);
+            }
+            if (this.map.getSource(sourceId)) {
+                this.map.removeSource(sourceId);
+            }
+            this.highlightedBuildingGeometry = null;
+            return;
+        }
+
+        const lon = highlightedBuilding.lon;
+        const lat = highlightedBuilding.lat;
+
+        // If we already have the geometry cached, just ensure the layer exists
+        if (this.highlightedBuildingGeometry && this.state.buildingHighlighted) {
+            return;
+        }
+
+        // Check if the point is visible on screen
+        const bounds = this.map.getBounds();
+        if (!bounds.contains([lon, lat])) {
+            return;
+        }
+
+        // Query rendered features using a small bounding box around the point
+        const point = this.map.project([lon, lat]);
+        const bbox: [maplibregl.PointLike, maplibregl.PointLike] = [
+            [point.x - 1, point.y - 1],
+            [point.x + 1, point.y + 1],
+        ];
+
+        const features = this.map.queryRenderedFeatures(bbox, {
+            layers: ["building-3d"],
+        });
+
+        if (!features || features.length === 0) {
+            return;
+        }
+
+        // Find the building that actually contains our point using point-in-polygon
+        const building = features.find((f) => {
+            const geom = f.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon;
+            return this.pointInPolygon(lon, lat, geom);
+        }) || features[0];
+
+        // Extract only the single polygon containing our point (not the whole MultiPolygon)
+        let singlePolygonGeometry: GeoJSON.Polygon;
+        const geom = building.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon;
+
+        if (geom.type === "MultiPolygon") {
+            // Find which polygon in the MultiPolygon contains our point
+            const containingPolygon = geom.coordinates.find((polygonCoords) => {
+                return this.pointInRing(lon, lat, polygonCoords[0]);
+            });
+
+            if (containingPolygon) {
+                singlePolygonGeometry = {
+                    type: "Polygon",
+                    coordinates: containingPolygon,
+                };
+            } else {
+                // Fallback to first polygon
+                singlePolygonGeometry = {
+                    type: "Polygon",
+                    coordinates: geom.coordinates[0],
+                };
+            }
+        } else {
+            singlePolygonGeometry = geom;
+        }
+
+        // Expand polygon slightly outward to avoid z-fighting with original building
+        singlePolygonGeometry = this.expandPolygon(singlePolygonGeometry, 1.002);
+
+        // Cache the geometry so we don't re-query
+        this.highlightedBuildingGeometry = {
+            type: "Feature",
+            geometry: singlePolygonGeometry,
+            properties: {
+                render_height: building.properties?.render_height ?? 10,
+                render_min_height: building.properties?.render_min_height ?? 0,
+            },
+        };
+
+        // Clear existing layer/source before adding new ones
+        if (this.map.getLayer(layerId)) {
+            this.map.removeLayer(layerId);
+        }
+        if (this.map.getSource(sourceId)) {
+            this.map.removeSource(sourceId);
+        }
+
+        // Add source with just this one building
+        this.map.addSource(sourceId, {
+            type: "geojson",
+            data: {
+                type: "FeatureCollection",
+                features: [this.highlightedBuildingGeometry],
+            },
+        });
+
+        // Add highlight layer on top
+        this.map.addLayer({
+            id: layerId,
+            type: "fill-extrusion",
+            source: sourceId,
+            paint: {
+                "fill-extrusion-color": highlightedBuilding.color ?? "#ff0000",
+                "fill-extrusion-height": ["get", "render_height"],
+                "fill-extrusion-base": ["get", "render_min_height"],
+                "fill-extrusion-opacity": 1,
+            },
+        });
+
+        this.setState({ buildingHighlighted: true });
+    }
+
+    // Expand polygon outward from centroid by a scale factor
+    private expandPolygon(polygon: GeoJSON.Polygon, scale: number): GeoJSON.Polygon {
+        const ring = polygon.coordinates[0];
+
+        // Calculate centroid
+        let cx = 0, cy = 0;
+        for (const [x, y] of ring) {
+            cx += x;
+            cy += y;
+        }
+        cx /= ring.length;
+        cy /= ring.length;
+
+        // Scale each point outward from centroid
+        const expandedRing = ring.map(([x, y]) => [
+            cx + (x - cx) * scale,
+            cy + (y - cy) * scale,
+        ]);
+
+        return {
+            type: "Polygon",
+            coordinates: [expandedRing],
+        };
+    }
+
+    // Simple point-in-polygon check
+    private pointInPolygon(x: number, y: number, geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon): boolean {
+        const polygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+
+        for (const polygon of polygons) {
+            if (this.pointInRing(x, y, polygon[0])) {
+                // Check if point is in any holes
+                let inHole = false;
+                for (let i = 1; i < polygon.length; i++) {
+                    if (this.pointInRing(x, y, polygon[i])) {
+                        inHole = true;
+                        break;
+                    }
+                }
+                if (!inHole) return true;
+            }
+        }
+        return false;
+    }
+
+    private pointInRing(x: number, y: number, ring: number[][]): boolean {
+        let inside = false;
+        for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+            const xi = ring[i][0], yi = ring[i][1];
+            const xj = ring[j][0], yj = ring[j][1];
+
+            if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+                inside = !inside;
+            }
+        }
+        return inside;
     }
 
     private updateNavigationPointsLayer() {
