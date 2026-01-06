@@ -3,13 +3,25 @@ import { Moon, Sun } from "lucide-react";
 import { Switch } from "./ui/switch";
 import { Label } from "./ui/label";
 import { featureManager } from "./vehicles/features";
+import type { RendezvousState } from "../hooks/useRendezvous";
 
 interface FeaturesPanelProps {
     isDark: boolean;
     onThemeChange: (isDark: boolean) => void;
+    rendezvousEnabled: boolean;
+    onRendezvousChange: (enabled: boolean) => void;
+    rendezvousState: RendezvousState | null;
+    shouldFlash: boolean;
 }
 
-export function FeaturesPanel({ isDark, onThemeChange }: FeaturesPanelProps) {
+export function FeaturesPanel({
+    isDark,
+    onThemeChange,
+    rendezvousEnabled,
+    onRendezvousChange,
+    rendezvousState,
+    shouldFlash,
+}: FeaturesPanelProps) {
     const [features, setFeatures] = useState(featureManager.getAllFeatures());
 
     const handleToggle = (featureId: string) => {
@@ -49,6 +61,47 @@ export function FeaturesPanel({ isDark, onThemeChange }: FeaturesPanelProps) {
             <div>
                 <h3 className="text-sm font-medium text-muted-foreground mb-3">Simulation</h3>
                 <div className="space-y-4">
+                    {/* Königsplatz Rendezvous */}
+                    <div className="flex items-start gap-3">
+                        <Switch
+                            id="rendezvous"
+                            checked={rendezvousEnabled}
+                            onCheckedChange={onRendezvousChange}
+                        />
+                        <div className="space-y-1 flex-1">
+                            <Label htmlFor="rendezvous" className="font-medium cursor-pointer">
+                                Königsplatz Rendezvous
+                            </Label>
+                            <p className="text-sm text-muted-foreground">
+                                Building lights up when trams meet (20:30-00:00)
+                            </p>
+                            {rendezvousEnabled && rendezvousState && (
+                                <div className="mt-2 p-2 rounded bg-muted text-xs">
+                                    <div className="flex items-center gap-2">
+                                        <span
+                                            className="w-3 h-3 rounded-full shrink-0"
+                                            style={{
+                                                backgroundColor: rendezvousState.isRendezvous ? "#18ed31" : "#1155f5",
+                                                animation: shouldFlash ? "pulse 0.5s infinite" : "none",
+                                            }}
+                                        />
+                                        <span>
+                                            {rendezvousState.isRendezvous
+                                                ? `Rendezvous! ${rendezvousState.tramCount} trams`
+                                                : `Waiting (${rendezvousState.tramCount} tram${rendezvousState.tramCount !== 1 ? "s" : ""})`}
+                                        </span>
+                                    </div>
+                                </div>
+                            )}
+                            {rendezvousEnabled && !rendezvousState && (
+                                <div className="mt-2 p-2 rounded bg-muted text-xs text-muted-foreground">
+                                    Inactive (outside 20:30-00:00 or not dark)
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Other features from feature manager */}
                     {features.map((feature) => (
                         <div key={feature.id} className="flex items-start gap-3">
                             <Switch
@@ -66,12 +119,6 @@ export function FeaturesPanel({ isDark, onThemeChange }: FeaturesPanelProps) {
                             </div>
                         </div>
                     ))}
-
-                    {features.length === 0 && (
-                        <p className="text-sm text-muted-foreground">
-                            No simulation features available
-                        </p>
-                    )}
                 </div>
             </div>
         </div>

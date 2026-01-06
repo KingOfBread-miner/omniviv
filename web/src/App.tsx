@@ -11,6 +11,7 @@ import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
 import Map from "./components/map/Map";
 import type { DebugOptions } from "./components/vehicles/VehicleRenderer";
+import { useRendezvous } from "./hooks/useRendezvous";
 import { useTimeSimulation } from "./hooks/useTimeSimulation";
 import { useVehicleUpdates, type RouteVehicles } from "./hooks/useVehicleUpdates";
 
@@ -43,6 +44,7 @@ interface PersistedOptions {
     showRoutes: boolean;
     showVehicles: boolean;
     debugOptions: DebugOptions;
+    rendezvousEnabled: boolean;
 }
 
 const DEFAULT_OPTIONS: PersistedOptions = {
@@ -57,6 +59,7 @@ const DEFAULT_OPTIONS: PersistedOptions = {
         showDebugSegments: false,
         showDebugOnlyTracked: true,
     },
+    rendezvousEnabled: false,
 };
 
 function loadOptions(): PersistedOptions {
@@ -101,6 +104,9 @@ export default function App() {
     const [navEnd, setNavEnd] = useState<Location | null>(null);
     const [pickMode, setPickMode] = useState<PickMode>(null);
 
+    // Highlighted building state
+    const [highlightedBuilding, setHighlightedBuilding] = useState<{ lat: number; lon: number; color?: string } | null>(null);
+
     // Theme state
     const [isDark, setIsDark] = useState(() => {
         const stored = localStorage.getItem("theme");
@@ -125,7 +131,19 @@ export default function App() {
     }, [options]);
 
     // Destructure for easier access
-    const { showAreaOutlines, showStations, showStopPositions, showPlatforms, showRoutes, showVehicles, debugOptions } = options;
+    const { showAreaOutlines, showStations, showStopPositions, showPlatforms, showRoutes, showVehicles, debugOptions, rendezvousEnabled } = options;
+
+    // Königsplatz rendezvous feature
+    const { rendezvousState, highlightedBuilding: rendezvousBuilding, shouldFlash } = useRendezvous({
+        enabled: rendezvousEnabled,
+        currentTime: timeSimulation.currentTime,
+        vehicles,
+    });
+
+    // Update highlighted building based on rendezvous state
+    useEffect(() => {
+        setHighlightedBuilding(rendezvousBuilding);
+    }, [rendezvousBuilding]);
 
     // Memoize vehicle count to avoid recalculating on every render
     const totalVehicleCount = useMemo(
@@ -478,7 +496,14 @@ export default function App() {
                         )}
 
                         {activePanel === "features" && (
-                            <FeaturesPanel isDark={isDark} onThemeChange={setIsDark} />
+                            <FeaturesPanel
+                                isDark={isDark}
+                                onThemeChange={setIsDark}
+                                rendezvousEnabled={rendezvousEnabled}
+                                onRendezvousChange={(enabled) => updateOption("rendezvousEnabled", enabled)}
+                                rendezvousState={rendezvousState}
+                                shouldFlash={shouldFlash}
+                            />
                         )}
 
                         {activePanel === "debug" && (
@@ -549,6 +574,8 @@ export default function App() {
                     onCancelPickMode={() => setPickMode(null)}
                     navigationStart={navStart}
                     navigationEnd={navEnd}
+                    highlightedBuilding={highlightedBuilding}
+                    onHighlightBuilding={setHighlightedBuilding}
                 />
             </div>
         </div>
