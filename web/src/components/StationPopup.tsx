@@ -27,17 +27,17 @@ export function StationPopup({ station, onPlatformClick }: StationPopupProps) {
     }
 
     return (
-        <div className="p-4 pr-8">
-            <div className="font-semibold text-gray-900">{station.name || "Unknown station"}</div>
+        <div className="p-4 pr-8 bg-popover text-popover-foreground rounded-lg">
+            <div className="font-semibold">{station.name || "Unknown station"}</div>
             {uniquePlatforms.length > 0 && (
-                <div className="mt-3 border-t pt-2">
-                    <div className="text-xs text-gray-500 mb-1">Platforms ({uniquePlatforms.length})</div>
+                <div className="mt-3 border-t border-border pt-2">
+                    <div className="text-xs text-muted-foreground mb-1">Platforms ({uniquePlatforms.length})</div>
                     <div className="flex flex-wrap gap-2">
                         {uniquePlatforms.map((p, idx) => (
                             <button
                                 key={idx}
                                 onClick={() => onPlatformClick(p)}
-                                className="px-2 py-1 text-sm font-medium bg-gray-100 hover:bg-gray-200 rounded transition-colors"
+                                className="px-2 py-1 text-sm font-medium bg-secondary hover:bg-secondary/80 text-secondary-foreground rounded transition-colors"
                             >
                                 {getPlatformDisplayName(p)}
                             </button>
@@ -47,7 +47,7 @@ export function StationPopup({ station, onPlatformClick }: StationPopupProps) {
             )}
             <button
                 onClick={() => console.log("Station:", station)}
-                className="mt-3 p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded"
+                className="mt-3 p-1.5 text-muted-foreground hover:text-foreground hover:bg-secondary rounded"
                 title="Log to console"
             >
                 <Terminal className="w-4 h-4" />
