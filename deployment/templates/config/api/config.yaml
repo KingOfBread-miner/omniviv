@@ -1,0 +1,24 @@
+# Omniviv API Configuration
+
+# CORS configuration
+# For development, enable permissive mode (allows all origins)
+cors_permissive: true
+# For production, disable permissive and specify allowed origins:
+# cors_permissive: false
+# cors_origins:
+#   - "https://your-domain.com"
+
+# Areas to fetch OSM data from
+# Each area is defined by a bounding box (south, west, north, east)
+areas:
+    - name: "Augsburg"
+      # Greater Augsburg area bounding box
+      bounding_box:
+          south: 48.20
+          west: 10.75
+          north: 48.48
+          east: 11.05
+      # Public transport types to fetch
+      transport_types:
+          - tram
+          # - bus  # Disabled temporarily - too many stops overwhelm Overpass API

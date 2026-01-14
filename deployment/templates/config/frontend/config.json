@@ -1,0 +1,6 @@
+{{- $apiHostname := mowsJoinDomain .services.api.subdomain (ternary "localhost" .domain (eq .routing "local")) -}}
+{{- $martinHostname := mowsJoinDomain .services.martin.subdomain (ternary "localhost" .domain (eq .routing "local")) -}}
+{
+    "apiUrl": "{{ ternary "https://" "http://" .tls }}{{ $apiHostname }}",
+    "martinUrl": "{{ ternary "https://" "http://" .tls }}{{ $martinHostname }}"
+}

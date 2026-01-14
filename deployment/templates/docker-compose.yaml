@@ -1,0 +1,158 @@
+{{- $apiHostname := mowsJoinDomain .services.api.subdomain (ternary "localhost" .domain (eq .routing "local")) -}}
+{{- $webHostname := mowsJoinDomain .services.web.subdomain (ternary "localhost" .domain (eq .routing "local")) -}}
+{{- $martinHostname := mowsJoinDomain .services.martin.subdomain (ternary "localhost" .domain (eq .routing "local")) -}}
+{{- if and .services.api.database.storage.volumeName .services.api.database.storage.absolutePath -}}
+{{- fail "Cannot specify both volumeName and absolutePath for api database storage" -}}
+{{- end -}}
+
+services:
+    api:
+        {{- if eq .services.api.build.enabled true }}
+        build:
+            context: "{{ .services.api.build.context }}"
+            dockerfile: "{{ .services.api.build.dockerfile }}"
+        {{- else }}
+        image: "{{ .services.api.image }}"
+        {{- end }}
+        container_name: omniviv-api
+        restart: unless-stopped
+        volumes:
+            - ./config/api/config.yaml:/app/config.yaml:ro
+            {{- if .services.api.database.storage.volumeName }}
+            - {{ .services.api.database.storage.volumeName }}:/app/database
+            {{- else if .services.api.database.storage.absolutePath }}
+            - {{ .services.api.database.storage.absolutePath }}:/app/database
+            {{- end }}
+        networks:
+            - {{ .reverseProxy.network }}
+        labels:
+            traefik:
+                docker:
+                    network: {{ .reverseProxy.network }}
+                enable: true
+                http:
+                    routers:
+                        omniviv-api:
+                            rule: "Host(`{{ $apiHostname }}`)"
+                            entrypoints: {{ ternary "websecure" "web" .tls }}
+                            service: omniviv-api
+                            {{- if eq .tls true }}
+                            tls:
+                                certresolver: "default"
+                                domains:
+                                    - main: "{{ .domain }}"
+                                      sans: "*.{{ .domain }}"
+                            {{- end }}
+                    services:
+                        omniviv-api:
+                            loadbalancer:
+                                server:
+                                    port: "3000"
+
+    web:
+        {{- if eq .services.web.build.enabled true }}
+        build:
+            context: "{{ .services.web.build.context }}"
+            dockerfile: "{{ .services.web.build.dockerfile }}"
+        {{- else }}
+        image: "{{ .services.web.image }}"
+        {{- end }}
+        container_name: omniviv-web
+        restart: unless-stopped
+        environment:
+            CSP_CONNECT_SRC: {{ ternary "https://" "http://" .tls }}{{ $apiHostname }} {{ ternary "wss://" "ws://" .tls }}{{ $apiHostname }} {{ ternary "https://" "http://" .tls }}{{ $martinHostname }}
+        volumes:
+            - ./config/frontend/config.json:/public/config.json:ro
+        networks:
+            - {{ .reverseProxy.network }}
+        labels:
+            traefik:
+                docker:
+                    network: {{ .reverseProxy.network }}
+                enable: true
+                http:
+                    routers:
+                        omniviv-web:
+                            rule: "Host(`{{ $webHostname }}`)"
+                            entrypoints: {{ ternary "websecure" "web" .tls }}
+                            service: omniviv-web
+                            {{- if eq .tls true }}
+                            tls:
+                                certresolver: "default"
+                                domains:
+                                    - main: "{{ .domain }}"
+                                      sans: "*.{{ .domain }}"
+                            {{- end }}
+                    services:
+                        omniviv-web:
+                            loadbalancer:
+                                server:
+                                    port: "80"
+
+    martin:
+        image: "{{ .services.martin.image }}"
+        container_name: omniviv-martin
+        restart: unless-stopped
+        volumes:
+            - "{{ .services.martin.dataPath }}mbtiles:/mbtiles:ro"
+            - "{{ .services.martin.dataPath }}fonts:/fonts:ro"
+            - "{{ .services.martin.dataPath }}sprites:/sprites:ro"
+        command: /mbtiles --font /fonts
+        networks:
+            - {{ .reverseProxy.network }}
+        labels:
+            traefik:
+                docker:
+                    network: {{ .reverseProxy.network }}
+                enable: true
+                http:
+                    routers:
+                        omniviv-martin:
+                            rule: "Host(`{{ $martinHostname }}`)"
+                            entrypoints: {{ ternary "websecure" "web" .tls }}
+                            service: omniviv-martin
+                            middlewares: omniviv-martin-cache
+                            {{- if eq .tls true }}
+                            tls:
+                                certresolver: "default"
+                                domains:
+                                    - main: "{{ .domain }}"
+                                      sans: "*.{{ .domain }}"
+                            {{- end }}
+                    middlewares:
+                        omniviv-martin-cache:
+                            headers:
+                                customResponseHeaders:
+                                    Cache-Control: "public, max-age={{ .services.martin.cacheSeconds }}"
+                    services:
+                        omniviv-martin:
+                            loadbalancer:
+                                server:
+                                    port: "3000"
+
+    {{- if eq .reverseProxy.create true }}
+    traefik:
+        image: traefik:v3
+        container_name: omniviv-traefik
+        restart: unless-stopped
+        command:
+            - "--providers.docker=true"
+            - "--entrypoints.web.address=:80"
+        networks:
+            - {{ .reverseProxy.network }}
+        ports:
+            - "80:80"
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+    {{- end }}
+
+{{- if .services.api.database.storage.volumeName }}
+volumes:
+    {{ .services.api.database.storage.volumeName }}:
+{{- end }}
+
+networks:
+    {{ .reverseProxy.network }}:
+        {{- if ne .reverseProxy.create true }}
+        external: true
+        {{- end }}
