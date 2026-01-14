@@ -1,17 +1,47 @@
+import { Info, Minus, Plus } from "lucide-react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import React from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { Area, Station, StationPlatform, StationStopPosition } from "../../api";
 import type { RouteVehicles, RouteWithGeometry } from "../../App";
+import { getConfig } from "../../config";
 import { PlatformPopup } from "../PlatformPopup";
 import { StationPopup } from "../StationPopup";
+import { Button } from "../ui/button";
 import { VehicleRenderer } from "../vehicles/VehicleRenderer";
 import type { DebugOptions } from "../vehicles/VehicleRenderer";
 import { VehicleTracker, type TrackingInfo } from "../vehicles/VehicleTracker";
 import { MapLayerManager } from "./MapLayerManager";
 
 const MAP_STYLE_URL = import.meta.env.VITE_MAP_STYLE_URL ?? "/styles/basic-preview/style.json";
+
+async function loadMapStyle(): Promise<maplibregl.StyleSpecification> {
+    const response = await fetch(MAP_STYLE_URL);
+    const style = await response.json();
+    const martinUrl = getConfig().martinUrl;
+
+    // Replace tile source URLs
+    if (style.sources) {
+        for (const source of Object.values(style.sources) as { url?: string }[]) {
+            if (source.url && source.url.includes("localhost")) {
+                source.url = source.url.replace(/http:\/\/localhost:\d+/, martinUrl);
+            }
+        }
+    }
+
+    // Replace glyph URL
+    if (style.glyphs && style.glyphs.includes("localhost")) {
+        style.glyphs = style.glyphs.replace(/http:\/\/localhost:\d+/, martinUrl);
+    }
+
+    // Replace sprite URL if present
+    if (style.sprite && style.sprite.includes("localhost")) {
+        style.sprite = style.sprite.replace(/http:\/\/localhost:\d+/, martinUrl);
+    }
+
+    return style;
+}
 const ANIMATION_INTERVAL = 50;
 
 type PickMode = "start" | "end" | null;
@@ -72,6 +102,11 @@ interface MapState {
     contextMenu: ContextMenuState | null;
     measurement: MeasurementState;
     buildingHighlighted: boolean;
+    bearing: number;
+    zoom: number;
+    scaleWidth: number;
+    scaleLabel: string;
+    attributionExpanded: boolean;
 }
 
 export default class Map extends React.Component<MapProps, MapState> {
@@ -103,6 +138,11 @@ export default class Map extends React.Component<MapProps, MapState> {
                 isActive: false,
             },
             buildingHighlighted: false,
+            bearing: 0,
+            zoom: 12,
+            scaleWidth: 100,
+            scaleLabel: "",
+            attributionExpanded: false,
         };
     }
 
@@ -246,6 +286,54 @@ export default class Map extends React.Component<MapProps, MapState> {
         }
     }
 
+    private updateScale = () => {
+        if (!this.map) return;
+
+        const maxWidth = 100;
+        const y = this.map.getContainer().clientHeight / 2;
+        const left = this.map.unproject([0, y]);
+        const right = this.map.unproject([maxWidth, y]);
+
+        const maxMeters = left.distanceTo(right);
+        let distance = maxMeters;
+        let unit = "m";
+
+        if (distance >= 1000) {
+            distance /= 1000;
+            unit = "km";
+        }
+
+        // Round to a nice number
+        const roundedDistance = this.getRoundedDistance(distance);
+        const ratio = roundedDistance / distance;
+        const width = maxWidth * ratio;
+
+        this.setState({
+            scaleWidth: width,
+            scaleLabel: `${roundedDistance} ${unit}`,
+        });
+    };
+
+    private getRoundedDistance = (distance: number): number => {
+        const d = Math.pow(10, Math.floor(Math.log10(distance)));
+        const normalized = distance / d;
+        if (normalized < 2) return d * 1;
+        if (normalized < 5) return d * 2;
+        return d * 5;
+    };
+
+    private handleZoomIn = () => {
+        this.map?.zoomIn();
+    };
+
+    private handleZoomOut = () => {
+        this.map?.zoomOut();
+    };
+
+    private handleResetBearing = () => {
+        this.map?.resetNorth();
+    };
+
     private showPopup = (coordinates: [number, number], content: React.ReactNode) => {
         if (!this.map) return;
 
@@ -275,23 +363,33 @@ export default class Map extends React.Component<MapProps, MapState> {
         });
     };
 
-    private initializeMap() {
+    private async initializeMap() {
         if (!this.mapContainer.current || this.map) return;
+
+        const style = await loadMapStyle();
 
         this.map = new maplibregl.Map({
             container: this.mapContainer.current,
-            style: MAP_STYLE_URL,
+            style,
             center: [10.898, 48.371],
             zoom: 12,
             pitch: 30,
+            attributionControl: false,
         });
 
         this.map.on("error", (e) => {
             console.error("Map error:", e.error?.message || e);
         });
 
-        this.map.addControl(new maplibregl.NavigationControl(), "top-right");
-        this.map.addControl(new maplibregl.ScaleControl(), "bottom-left");
+        // Update bearing, zoom, and scale on map move
+        this.map.on("move", () => {
+            if (!this.map) return;
+            this.setState({
+                bearing: this.map.getBearing(),
+                zoom: this.map.getZoom(),
+            });
+            this.updateScale();
+        });
 
         this.map.on("load", () => {
             if (!this.map) return;
@@ -336,6 +434,7 @@ export default class Map extends React.Component<MapProps, MapState> {
 
             this.setupMapEventHandlers();
             this.setState({ mapLoaded: true });
+            this.updateScale();
 
             // Re-apply highlighted building when map moves (tiles may load)
             this.map.on("moveend", () => {
@@ -986,24 +1085,117 @@ export default class Map extends React.Component<MapProps, MapState> {
     }
 
     render() {
-        const { trackingInfo, contextMenu } = this.state;
+        const { trackingInfo, contextMenu, bearing, scaleWidth, scaleLabel, attributionExpanded } = this.state;
 
         return (
             <div className="relative w-full h-full bg-black">
                 <div ref={this.mapContainer} className="w-full h-full" />
+
+                {/* Custom map controls - top right */}
+                <div className="absolute top-4 right-4 flex flex-col gap-1">
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={this.handleZoomIn}
+                        title="Zoom in"
+                        className="h-8 w-8 shadow-md bg-background"
+                    >
+                        <Plus className="h-4 w-4" />
+                    </Button>
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={this.handleZoomOut}
+                        title="Zoom out"
+                        className="h-8 w-8 shadow-md bg-background"
+                    >
+                        <Minus className="h-4 w-4" />
+                    </Button>
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={this.handleResetBearing}
+                        title="Reset north"
+                        className="h-8 w-8 shadow-md bg-background"
+                    >
+                        <svg
+                            className="h-4 w-4"
+                            viewBox="0 0 24 24"
+                            style={{ transform: `rotate(${-bearing}deg)` }}
+                        >
+                            {/* North triangle - red */}
+                            <polygon points="12,2 8,12 16,12" fill="#ef4444" />
+                            {/* South triangle - primary */}
+                            <polygon points="12,22 8,12 16,12" className="fill-primary" />
+                        </svg>
+                    </Button>
+                </div>
+
+                {/* Scale indicator - bottom left */}
+                <div className="absolute bottom-4 left-4 bg-background rounded-md px-2 py-1 shadow-md flex items-center gap-1.5">
+                    <div
+                        className="border-b-2 border-l-2 border-r-2 border-foreground h-2"
+                        style={{ width: scaleWidth }}
+                    />
+                    <span className="text-[10px]">{scaleLabel}</span>
+                </div>
+
+                {/* Attribution - bottom right */}
+                <div className="absolute bottom-4 right-4 flex items-stretch">
+                    {attributionExpanded && (
+                        <div className="bg-background rounded-l-md px-3 text-xs flex items-center gap-2 shadow-md">
+                            <a
+                                href="https://www.openstreetmap.org/copyright"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="hover:underline"
+                            >
+                                © OpenStreetMap
+                            </a>
+                            <span>|</span>
+                            <a
+                                href="https://openmaptiles.org/"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="hover:underline"
+                            >
+                                © OpenMapTiles
+                            </a>
+                            <span>|</span>
+                            <a
+                                href="https://maplibre.org/"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="hover:underline"
+                            >
+                                MapLibre
+                            </a>
+                        </div>
+                    )}
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => this.setState({ attributionExpanded: !attributionExpanded })}
+                        title="Attribution"
+                        className={`h-8 w-8 shadow-md bg-background ${attributionExpanded ? "rounded-l-none" : ""}`}
+                    >
+                        <Info className="h-4 w-4" />
+                    </Button>
+                </div>
+
                 {trackingInfo && (
                     <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-[calc(100%+50px)] pointer-events-none">
-                        <div className="bg-white px-4 py-3 rounded-lg shadow-lg text-sm text-gray-800 min-w-48">
+                        <div className="bg-popover text-popover-foreground px-4 py-3 rounded-lg shadow-lg text-sm min-w-48 border">
                             <div className="font-bold text-base mb-1">
                                 {trackingInfo.lineNumber} → {trackingInfo.destination}
                             </div>
                             {trackingInfo.nextStopName && (
-                                <div className="text-gray-600">
+                                <div className="text-muted-foreground">
                                     <span className="font-medium">Next:</span> {trackingInfo.nextStopName}
                                 </div>
                             )}
                             <div className="flex items-center gap-2 mt-2">
-                                <div className="flex-1 h-2 bg-gray-200 rounded-full overflow-hidden">
+                                <div className="flex-1 h-2 bg-secondary rounded-full overflow-hidden">
                                     <div
                                         className="h-full transition-all duration-300"
                                         style={{
@@ -1013,7 +1205,7 @@ export default class Map extends React.Component<MapProps, MapState> {
                                     />
                                 </div>
                                 {trackingInfo.secondsToNextStop !== null && (
-                                    <span className="text-xs text-gray-500 font-mono tabular-nums">
+                                    <span className="text-xs text-muted-foreground font-mono tabular-nums">
                                         {`${Math.floor(trackingInfo.secondsToNextStop / 60)}m ${String(trackingInfo.secondsToNextStop % 60).padStart(2, "0")}s`}
                                     </span>
                                 )}
