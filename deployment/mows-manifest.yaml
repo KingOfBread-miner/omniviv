@@ -2,5 +2,5 @@ manifestVersion: "0.1"
 metadata:
   name: omniviv
   description: ""
-  version: "0.1"
+  version: "0.1.0"
 spec: {}
