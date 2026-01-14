@@ -11,14 +11,16 @@ headers:
             default-src 'none';
 
             script-src 'self';
-                        
+
+            worker-src 'self' blob: ;
+
             style-src 'self'; 
 
             manifest-src 'self';
 
-            connect-src 'self'; 
+            connect-src 'self' $CSP_CONNECT_SRC; 
 
-            img-src 'self'; 
+            img-src 'self' blob: data: ; 
 
             font-src 'self'; 
 
