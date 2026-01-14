@@ -83,7 +83,9 @@ See the [docs](docs/) folder for detailed documentation.
 Docker images are automatically built and published to GitHub Container Registry:
 
 - `ghcr.io/firstdorsal/omniviv-api`
-- `ghcr.io/firstdorsal/omniviv-web`
+- `ghcr.io/firstdorsal/omniviv-frontend`
+
+See [docs/releasing.md](docs/releasing.md) for the full release workflow.
 
 ## License
 

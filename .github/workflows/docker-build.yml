@@ -6,6 +6,7 @@ on:
         tags:
             - "api-v*"
             - "frontend-v*"
+            - "mpm-compose-omniviv-v*"
     pull_request:
         branches: [main]
 
@@ -158,6 +159,30 @@ jobs:
                       ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-frontend:latest
                   cache-from: type=gha,scope=frontend
                   cache-to: type=gha,mode=max,scope=frontend
+
+    release-deployment:
+        runs-on: ubuntu-latest
+        if: startsWith(github.ref, 'refs/tags/mpm-compose-omniviv-v')
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Extract version from tag
+              id: tag
+              run: |
+                  TAG_VERSION="${GITHUB_REF#refs/tags/mpm-compose-omniviv-v}"
+                  echo "version=$TAG_VERSION" >> $GITHUB_OUTPUT
+
+            - name: Verify version matches mows-manifest.yaml
+              run: |
+                  MANIFEST_VERSION=$(grep -A5 '^metadata:' deployment/mows-manifest.yaml | grep 'version:' | sed 's/.*version: *"\([^"]*\)".*/\1/')
+                  TAG_VERSION="${{ steps.tag.outputs.version }}"
+                  if [ "$MANIFEST_VERSION" != "$TAG_VERSION" ]; then
+                    echo "Error: Tag version ($TAG_VERSION) does not match mows-manifest.yaml ($MANIFEST_VERSION)"
+                    exit 1
+                  fi
+                  echo "Version verified: $TAG_VERSION"
 
     build-api-pr:
         runs-on: ubuntu-latest

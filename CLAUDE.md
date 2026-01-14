@@ -9,3 +9,5 @@
 -   Tailwind and shadcn should be used where possible
 
 -   NEVER advertise for yourself in git commits
+
+-   Release flow documentation is in docs/releasing.md

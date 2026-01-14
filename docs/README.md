@@ -8,6 +8,7 @@ This folder contains detailed documentation for the Omniviv project.
 - [Deployment](deployment.md) - Deployment guides
 - [API](api.md) - API documentation
 - [Development](development.md) - Development setup and guidelines
+- [Releasing](releasing.md) - Release flow and versioning
 
 ## Screenshots
 
