@@ -13,7 +13,7 @@
             "splitTerminals": [
                 {
                     "name": "backend",
-                    "commands": ["cd server", "cargo watch -x run"]
+                    "commands": ["cd api", "cargo watch -x run"]
                 }
             ]
         },

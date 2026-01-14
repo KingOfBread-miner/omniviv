@@ -6,6 +6,6 @@
 -   use post requests to allow sending parameters in a body and not through path or query parameters
 
 -   No inline styles should can be used
--   Tailwind should be used where possible
+-   Tailwind and shadcn should be used where possible
 
 -   NEVER advertise for yourself in git commits
