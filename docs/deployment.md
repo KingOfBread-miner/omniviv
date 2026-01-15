@@ -21,7 +21,7 @@ git clone https://github.com/firstdorsal/omniviv.git
 cd omniviv/deployment
 
 # Edit configuration
-vim values.yaml
+nano values.yaml
 
 # Deploy
 mpm compose up
