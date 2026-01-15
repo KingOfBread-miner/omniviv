@@ -16,12 +16,14 @@ Each component maintains its version in its native configuration file:
 | Frontend   | `web/package.json`                | `version`              |
 | Deployment | `deployment/mows-manifest.yaml`   | `metadata.version`     |
 
-## Automatic Builds (Main Branch)
+## Nightly Builds (Main Branch)
 
-When code is pushed to `main`, Docker images are automatically built and tagged as `latest` for components with changes:
+When code is pushed to `main`, Docker images are automatically built and tagged as `nightly` for components with changes:
 
-- Changes in `api/**` trigger `omniviv-api:latest` build
-- Changes in `web/**` trigger `omniviv-frontend:latest` build
+- Changes in `api/**` trigger `omniviv-api:nightly` build
+- Changes in `web/**` trigger `omniviv-frontend:nightly` build
+
+The `nightly` tag always points to the latest main branch build.
 
 ## Creating a Release
 
@@ -84,6 +86,14 @@ Images are published to GitHub Container Registry (ghcr.io):
 |-----------|------------------------------------------|
 | API       | `ghcr.io/<owner>/omniviv-api`            |
 | Frontend  | `ghcr.io/<owner>/omniviv-frontend`       |
+
+### Image Tags
+
+| Tag       | Description                                      |
+|-----------|--------------------------------------------------|
+| `latest`  | Most recent tagged release (stable)              |
+| `nightly` | Latest main branch build (may be unstable)       |
+| `x.y.z`   | Specific version (e.g., `0.2.0`)                 |
 
 ## Tag Summary
 
