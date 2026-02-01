@@ -92,27 +92,7 @@ impl EfaClient {
         params.insert("limit".to_string(), limit.to_string());
         params.insert("tram_only".to_string(), tram_only.to_string());
 
-        let mut url = format!(
-            "{}?mode=direct&name_dm={}&type_dm=stop&depType=stopEvents&outputFormat=rapidJSON&limit={}&useRealtime=1",
-            EFA_BASE_URL,
-            urlencoding::encode(stop_ifopt),
-            limit
-        );
-
-        if tram_only {
-            url.push_str("&includedMeans=4");
-        }
-
-        // Add time span to widen the query window
-        if let Some(minutes) = time_span_minutes {
-            url.push_str(&format!("&timeSpan={}", minutes));
-        }
-
-        // Add arrival/departure filter
-        match event_type {
-            StopEventType::Departure => url.push_str("&itdDateTimeDepArr=dep"),
-            StopEventType::Arrival => url.push_str("&itdDateTimeDepArr=arr"),
-        }
+        let url = build_stop_events_url(stop_ifopt, limit, tram_only, event_type, time_span_minutes);
 
         let response = match self.client.get(&url).send().await {
             Ok(resp) => resp,
@@ -731,6 +711,38 @@ impl CoordLocation {
     }
 }
 
+/// Build the URL for a stop events request (departures or arrivals).
+/// Extracted for testability.
+fn build_stop_events_url(
+    stop_ifopt: &str,
+    limit: u32,
+    tram_only: bool,
+    event_type: StopEventType,
+    time_span_minutes: Option<u32>,
+) -> String {
+    let mut url = format!(
+        "{}?mode=direct&name_dm={}&type_dm=stop&depType=stopEvents&outputFormat=rapidJSON&limit={}&useRealtime=1",
+        EFA_BASE_URL,
+        urlencoding::encode(stop_ifopt),
+        limit
+    );
+
+    if tram_only {
+        url.push_str("&includedMeans=4");
+    }
+
+    if let Some(minutes) = time_span_minutes {
+        url.push_str(&format!("&timeSpan={}", minutes));
+    }
+
+    match event_type {
+        StopEventType::Departure => url.push_str("&itdDateTimeDepArr=dep"),
+        StopEventType::Arrival => url.push_str("&itdDateTimeDepArr=arr"),
+    }
+
+    url
+}
+
 /// Platform information extracted from departure data
 #[derive(Debug, Clone)]
 pub struct PlatformInfo {
@@ -742,4 +754,227 @@ pub struct PlatformInfo {
     pub name: Option<String>,
     /// Parent station name
     pub station_name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_departure_without_time_span() {
+        let url = build_stop_events_url(
+            "de:09761:101",
+            10,
+            true,
+            StopEventType::Departure,
+            None,
+        );
+        assert!(url.contains("name_dm=de%3A09761%3A101"));
+        assert!(url.contains("limit=10"));
+        assert!(url.contains("includedMeans=4"));
+        assert!(url.contains("itdDateTimeDepArr=dep"));
+        assert!(!url.contains("timeSpan"));
+    }
+
+    #[test]
+    fn url_departure_with_time_span() {
+        let url = build_stop_events_url(
+            "de:09761:101",
+            30,
+            true,
+            StopEventType::Departure,
+            Some(60),
+        );
+        assert!(url.contains("limit=30"));
+        assert!(url.contains("timeSpan=60"));
+        assert!(url.contains("itdDateTimeDepArr=dep"));
+    }
+
+    #[test]
+    fn url_arrival_with_time_span() {
+        let url = build_stop_events_url(
+            "de:09761:101",
+            30,
+            false,
+            StopEventType::Arrival,
+            Some(120),
+        );
+        assert!(url.contains("timeSpan=120"));
+        assert!(url.contains("itdDateTimeDepArr=arr"));
+        assert!(!url.contains("includedMeans=4"));
+    }
+
+    #[test]
+    fn url_no_tram_filter() {
+        let url = build_stop_events_url(
+            "de:09761:101",
+            10,
+            false,
+            StopEventType::Departure,
+            None,
+        );
+        assert!(!url.contains("includedMeans"));
+    }
+
+    #[test]
+    fn url_time_span_zero_still_included() {
+        // timeSpan=0 is passed if Some(0) — caller is responsible for filtering
+        let url = build_stop_events_url(
+            "de:09761:101",
+            10,
+            true,
+            StopEventType::Departure,
+            Some(0),
+        );
+        assert!(url.contains("timeSpan=0"));
+    }
+
+    #[test]
+    fn url_encodes_special_characters_in_ifopt() {
+        let url = build_stop_events_url(
+            "de:09761:101:2:A1",
+            10,
+            true,
+            StopEventType::Departure,
+            None,
+        );
+        // Colons should be encoded
+        assert!(url.contains("name_dm=de%3A09761%3A101%3A2%3AA1"));
+    }
+
+    #[test]
+    fn url_starts_with_base_url() {
+        let url = build_stop_events_url(
+            "de:09761:101",
+            10,
+            true,
+            StopEventType::Departure,
+            None,
+        );
+        assert!(url.starts_with(EFA_BASE_URL));
+    }
+
+    #[test]
+    fn url_contains_required_params() {
+        let url = build_stop_events_url(
+            "de:09761:101",
+            10,
+            true,
+            StopEventType::Departure,
+            None,
+        );
+        assert!(url.contains("mode=direct"));
+        assert!(url.contains("type_dm=stop"));
+        assert!(url.contains("depType=stopEvents"));
+        assert!(url.contains("outputFormat=rapidJSON"));
+        assert!(url.contains("useRealtime=1"));
+    }
+
+    #[test]
+    fn efa_client_with_max_concurrent() {
+        let (tx, _) = broadcast::channel(10);
+        let client = EfaClient::with_max_concurrent(tx, 5).unwrap();
+        assert_eq!(client.rate_limiter.available_permits(), 5);
+    }
+
+    #[test]
+    fn efa_client_default_constructor() {
+        let (tx, _) = broadcast::channel(10);
+        let client = EfaClient::new(tx).unwrap();
+        assert_eq!(
+            client.rate_limiter.available_permits(),
+            DEFAULT_MAX_CONCURRENT_REQUESTS
+        );
+    }
+
+    #[test]
+    fn departure_response_deserialize_empty() {
+        let json = r#"{"version":"11.0","locations":[],"stopEvents":[]}"#;
+        let response: DepartureResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.version, Some("11.0".to_string()));
+        assert!(response.locations.is_empty());
+        assert!(response.stop_events.is_empty());
+    }
+
+    #[test]
+    fn departure_response_deserialize_with_events() {
+        let json = r#"{
+            "version": "11.0",
+            "locations": [],
+            "stopEvents": [{
+                "location": {
+                    "id": "de:09761:101:2:A1",
+                    "name": "Königsplatz",
+                    "disassembledName": "Bstg. A1",
+                    "type": "platform",
+                    "properties": {
+                        "stopId": "2000101",
+                        "area": "2",
+                        "platform": "A1",
+                        "platformName": "Bstg. A1"
+                    }
+                },
+                "departureTimePlanned": "2025-11-24T17:45:00Z",
+                "departureTimeEstimated": "2025-11-24T17:46:00Z",
+                "transportation": {
+                    "id": "avg:03001: :H:j25",
+                    "name": "Straßenbahn 1",
+                    "number": "1",
+                    "destination": {
+                        "id": "de:09761:1910",
+                        "name": "Göggingen",
+                        "type": "stop"
+                    },
+                    "origin": {
+                        "id": "de:09761:2820",
+                        "name": "Lechhausen",
+                        "type": "stop"
+                    }
+                },
+                "properties": {
+                    "AVMSTripID": "trip123"
+                },
+                "infos": []
+            }]
+        }"#;
+        let response: DepartureResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.stop_events.len(), 1);
+
+        let event = &response.stop_events[0];
+        assert_eq!(event.line_number(), Some("1"));
+        assert_eq!(event.destination(), Some("Göggingen"));
+        assert_eq!(event.origin(), Some("Lechhausen"));
+        assert_eq!(event.location_ifopt(), Some("de:09761:101:2:A1"));
+        assert_eq!(event.platform(), Some("A1"));
+        assert_eq!(event.trip_id(), Some("trip123"));
+        assert_eq!(event.planned_departure(), Some("2025-11-24T17:45:00Z"));
+        assert_eq!(event.estimated_departure(), Some("2025-11-24T17:46:00Z"));
+        assert_eq!(event.destination_id(), Some("de:09761:1910"));
+        assert_eq!(event.origin_id(), Some("de:09761:2820"));
+    }
+
+    #[test]
+    fn stop_event_with_missing_optional_fields() {
+        let json = r#"{
+            "location": null,
+            "departureTimePlanned": null,
+            "departureTimeEstimated": null,
+            "arrivalTimePlanned": null,
+            "arrivalTimeEstimated": null,
+            "transportation": null,
+            "infos": [],
+            "properties": null
+        }"#;
+        let event: StopEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.line_number(), None);
+        assert_eq!(event.destination(), None);
+        assert_eq!(event.origin(), None);
+        assert_eq!(event.location_ifopt(), None);
+        assert_eq!(event.platform(), None);
+        assert_eq!(event.trip_id(), None);
+        assert_eq!(event.planned_departure(), None);
+        assert_eq!(event.estimated_departure(), None);
+        assert_eq!(event.planned_arrival(), None);
+        assert_eq!(event.estimated_arrival(), None);
+    }
 }

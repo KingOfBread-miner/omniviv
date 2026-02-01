@@ -134,3 +134,144 @@ pub enum ConfigError {
     #[error("Failed to parse config: {0}")]
     ParseError(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn efa_sync_config_default_values() {
+        let config = EfaSyncConfig::default();
+        assert_eq!(config.interval_secs, 60);
+        assert_eq!(config.limit_per_stop, 30);
+        assert_eq!(config.time_span_minutes, 60);
+        assert_eq!(config.max_concurrent_requests, 10);
+        assert!(config.fetch_arrivals);
+    }
+
+    #[test]
+    fn efa_sync_config_deserialize_full() {
+        let yaml = r#"
+            interval_secs: 120
+            limit_per_stop: 50
+            time_span_minutes: 90
+            max_concurrent_requests: 5
+            fetch_arrivals: false
+        "#;
+        let config: EfaSyncConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.interval_secs, 120);
+        assert_eq!(config.limit_per_stop, 50);
+        assert_eq!(config.time_span_minutes, 90);
+        assert_eq!(config.max_concurrent_requests, 5);
+        assert!(!config.fetch_arrivals);
+    }
+
+    #[test]
+    fn efa_sync_config_deserialize_partial_uses_defaults() {
+        let yaml = r#"
+            interval_secs: 45
+        "#;
+        let config: EfaSyncConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.interval_secs, 45);
+        // Rest should be defaults
+        assert_eq!(config.limit_per_stop, 30);
+        assert_eq!(config.time_span_minutes, 60);
+        assert_eq!(config.max_concurrent_requests, 10);
+        assert!(config.fetch_arrivals);
+    }
+
+    #[test]
+    fn efa_sync_config_deserialize_empty_uses_defaults() {
+        let yaml = "{}";
+        let config: EfaSyncConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.interval_secs, 60);
+        assert_eq!(config.limit_per_stop, 30);
+        assert_eq!(config.time_span_minutes, 60);
+        assert_eq!(config.max_concurrent_requests, 10);
+        assert!(config.fetch_arrivals);
+    }
+
+    #[test]
+    fn config_without_efa_sync_uses_defaults() {
+        let yaml = r#"
+            areas:
+              - name: Test
+                bounding_box:
+                  south: 48.0
+                  west: 10.0
+                  north: 49.0
+                  east: 11.0
+                transport_types:
+                  - tram
+        "#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.efa_sync.interval_secs, 60);
+        assert_eq!(config.efa_sync.limit_per_stop, 30);
+        assert_eq!(config.efa_sync.time_span_minutes, 60);
+        assert_eq!(config.efa_sync.max_concurrent_requests, 10);
+        assert!(config.efa_sync.fetch_arrivals);
+    }
+
+    #[test]
+    fn config_with_efa_sync_overrides() {
+        let yaml = r#"
+            areas:
+              - name: Test
+                bounding_box:
+                  south: 48.0
+                  west: 10.0
+                  north: 49.0
+                  east: 11.0
+                transport_types:
+                  - tram
+            efa_sync:
+              interval_secs: 120
+              limit_per_stop: 50
+              time_span_minutes: 90
+              max_concurrent_requests: 5
+              fetch_arrivals: false
+        "#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.efa_sync.interval_secs, 120);
+        assert_eq!(config.efa_sync.limit_per_stop, 50);
+        assert_eq!(config.efa_sync.time_span_minutes, 90);
+        assert_eq!(config.efa_sync.max_concurrent_requests, 5);
+        assert!(!config.efa_sync.fetch_arrivals);
+    }
+
+    #[test]
+    fn config_with_partial_efa_sync() {
+        let yaml = r#"
+            areas:
+              - name: Test
+                bounding_box:
+                  south: 48.0
+                  west: 10.0
+                  north: 49.0
+                  east: 11.0
+                transport_types:
+                  - tram
+            efa_sync:
+              interval_secs: 90
+              fetch_arrivals: false
+        "#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.efa_sync.interval_secs, 90);
+        assert!(!config.efa_sync.fetch_arrivals);
+        // Rest should be defaults
+        assert_eq!(config.efa_sync.limit_per_stop, 30);
+        assert_eq!(config.efa_sync.time_span_minutes, 60);
+        assert_eq!(config.efa_sync.max_concurrent_requests, 10);
+    }
+
+    #[test]
+    fn load_actual_config_yaml() {
+        let config = Config::load("config.yaml").unwrap();
+        assert!(!config.areas.is_empty());
+        // Verify the efa_sync section was parsed from the file
+        assert!(config.efa_sync.interval_secs > 0);
+        assert!(config.efa_sync.limit_per_stop > 0);
+        assert!(config.efa_sync.time_span_minutes > 0);
+        assert!(config.efa_sync.max_concurrent_requests > 0);
+    }
+}
