@@ -1,0 +1,34 @@
+routing: local # local | domain
+tls: false # only supported with existing traefik
+
+reverseProxy:
+    create: true
+    network: rp
+
+domain: vindelicum.eu
+
+services:
+    api:
+        subdomain: omniviv-api
+        database:
+            type: sqlite
+            storage:
+                volumeName: omniviv-api-database
+                absolutePath: null
+        build:
+            enabled: true
+            context: ../../api
+            dockerfile: Dockerfile
+        image: ghcr.io/firstdorsal/omniviv-api:latest
+    web:
+        subdomain: omniviv
+        build:
+            enabled: true
+            context: ../../web
+            dockerfile: Dockerfile
+        image: ghcr.io/firstdorsal/omniviv-frontend:latest
+    martin:
+        subdomain: omniviv-martin
+        image: ghcr.io/maplibre/martin
+        dataPath: ./data/
+        cacheSeconds: 86400 # 1 day
