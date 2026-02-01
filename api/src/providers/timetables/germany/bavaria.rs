@@ -12,8 +12,8 @@ use crate::sync::EfaRequestLog;
 
 const EFA_BASE_URL: &str = "https://bahnland-bayern.de/efa/XML_DM_REQUEST";
 const EFA_COORD_URL: &str = "https://bahnland-bayern.de/efa/XML_COORD_REQUEST";
-/// Maximum concurrent requests to EFA API to avoid overwhelming the service
-const MAX_CONCURRENT_REQUESTS: usize = 10;
+/// Default maximum concurrent requests to EFA API to avoid overwhelming the service
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 10;
 
 /// Type of stop event (departure or arrival)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +43,13 @@ pub struct EfaClient {
 
 impl EfaClient {
     pub fn new(diagnostics_tx: broadcast::Sender<EfaRequestLog>) -> Result<Self, EfaError> {
+        Self::with_max_concurrent(diagnostics_tx, DEFAULT_MAX_CONCURRENT_REQUESTS)
+    }
+
+    pub fn with_max_concurrent(
+        diagnostics_tx: broadcast::Sender<EfaRequestLog>,
+        max_concurrent_requests: usize,
+    ) -> Result<Self, EfaError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -51,7 +58,7 @@ impl EfaClient {
 
         Ok(Self {
             client,
-            rate_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            rate_limiter: Arc::new(Semaphore::new(max_concurrent_requests)),
             diagnostics_tx,
         })
     }
@@ -63,12 +70,14 @@ impl EfaClient {
     }
 
     /// Fetch stop events (departures or arrivals) for a stop by its IFOPT ID
+    /// `time_span_minutes` sets the EFA `timeSpan` parameter to widen the query window.
     async fn get_stop_events(
         &self,
         stop_ifopt: &str,
         limit: u32,
         tram_only: bool,
         event_type: StopEventType,
+        time_span_minutes: Option<u32>,
     ) -> Result<DepartureResponse, EfaError> {
         let start = Instant::now();
         let request_id = Uuid::new_v4().to_string();
@@ -92,6 +101,11 @@ impl EfaClient {
 
         if tram_only {
             url.push_str("&includedMeans=4");
+        }
+
+        // Add time span to widen the query window
+        if let Some(minutes) = time_span_minutes {
+            url.push_str(&format!("&timeSpan={}", minutes));
         }
 
         // Add arrival/departure filter
@@ -201,8 +215,9 @@ impl EfaClient {
         stop_ifopt: &str,
         limit: u32,
         tram_only: bool,
+        time_span_minutes: Option<u32>,
     ) -> Result<DepartureResponse, EfaError> {
-        self.get_stop_events(stop_ifopt, limit, tram_only, StopEventType::Departure)
+        self.get_stop_events(stop_ifopt, limit, tram_only, StopEventType::Departure, time_span_minutes)
             .await
     }
 
@@ -212,8 +227,9 @@ impl EfaClient {
         stop_ifopt: &str,
         limit: u32,
         tram_only: bool,
+        time_span_minutes: Option<u32>,
     ) -> Result<DepartureResponse, EfaError> {
-        self.get_stop_events(stop_ifopt, limit, tram_only, StopEventType::Arrival)
+        self.get_stop_events(stop_ifopt, limit, tram_only, StopEventType::Arrival, time_span_minutes)
             .await
     }
 
@@ -224,6 +240,7 @@ impl EfaClient {
         limit_per_stop: u32,
         tram_only: bool,
         event_type: StopEventType,
+        time_span_minutes: Option<u32>,
     ) -> Vec<(String, Result<DepartureResponse, EfaError>)> {
         let semaphore = self.rate_limiter.clone();
 
@@ -246,7 +263,7 @@ impl EfaClient {
                         }
                     };
                     let result = self
-                        .get_stop_events(&ifopt, limit_per_stop, tram_only, event_type)
+                        .get_stop_events(&ifopt, limit_per_stop, tram_only, event_type, time_span_minutes)
                         .await;
                     (ifopt, result)
                 }
@@ -262,8 +279,9 @@ impl EfaClient {
         stop_ifopts: &[String],
         limit_per_stop: u32,
         tram_only: bool,
+        time_span_minutes: Option<u32>,
     ) -> Vec<(String, Result<DepartureResponse, EfaError>)> {
-        self.get_stop_events_batch(stop_ifopts, limit_per_stop, tram_only, StopEventType::Departure)
+        self.get_stop_events_batch(stop_ifopts, limit_per_stop, tram_only, StopEventType::Departure, time_span_minutes)
             .await
     }
 
@@ -273,8 +291,9 @@ impl EfaClient {
         stop_ifopts: &[String],
         limit_per_stop: u32,
         tram_only: bool,
+        time_span_minutes: Option<u32>,
     ) -> Vec<(String, Result<DepartureResponse, EfaError>)> {
-        self.get_stop_events_batch(stop_ifopts, limit_per_stop, tram_only, StopEventType::Arrival)
+        self.get_stop_events_batch(stop_ifopts, limit_per_stop, tram_only, StopEventType::Arrival, time_span_minutes)
             .await
     }
 
@@ -400,7 +419,7 @@ impl EfaClient {
         station_ifopt: &str,
     ) -> Result<Vec<PlatformInfo>, EfaError> {
         // Query departures for this station to get platform information
-        let response = self.get_stop_events(station_ifopt, 20, false, StopEventType::Departure).await?;
+        let response = self.get_stop_events(station_ifopt, 20, false, StopEventType::Departure, None).await?;
 
         let mut platforms: std::collections::HashMap<String, PlatformInfo> = std::collections::HashMap::new();
 

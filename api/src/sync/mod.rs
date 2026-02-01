@@ -44,8 +44,11 @@ impl SyncManager {
         // Create broadcast channel for EFA request diagnostics (capacity 100)
         let (efa_requests_tx, _) = broadcast::channel(100);
 
-        let efa_client = EfaClient::new(efa_requests_tx.clone())
-            .map_err(|e| SyncError::EfaError(e.to_string()))?;
+        let efa_client = EfaClient::with_max_concurrent(
+            efa_requests_tx.clone(),
+            config.efa_sync.max_concurrent_requests,
+        )
+        .map_err(|e| SyncError::EfaError(e.to_string()))?;
 
         // Create broadcast channel for vehicle updates (capacity 16 - clients will get latest state anyway)
         let (vehicle_updates_tx, _) = broadcast::channel(16);
@@ -103,13 +106,19 @@ impl SyncManager {
             }
         });
 
-        // Spawn departure sync loop (every 30 seconds)
+        // Spawn departure sync loop (configurable interval)
         let efa_self = self.clone();
         let efa_handle = tokio::spawn(async move {
             // Wait a bit for initial OSM sync to complete
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            let interval_secs = {
+                let config = efa_self.config.read().await;
+                config.efa_sync.interval_secs
+            };
+            info!(interval_secs, "Starting EFA departure sync loop");
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
 
             loop {
                 interval.tick().await;
@@ -1284,13 +1293,48 @@ impl SyncManager {
             .into_iter()
             .collect();
 
-        info!(count = station_ifopts.len(), "Fetching departures and arrivals for stations");
+        // Read sync config
+        let efa_sync_config = {
+            let config = self.config.read().await;
+            config.efa_sync.clone()
+        };
+        let time_span = if efa_sync_config.time_span_minutes > 0 {
+            Some(efa_sync_config.time_span_minutes)
+        } else {
+            None
+        };
 
-        // Fetch departures and arrivals concurrently
-        let (departure_results, arrival_results) = tokio::join!(
-            self.efa_client.get_departures_batch(&station_ifopts, 10, true),
-            self.efa_client.get_arrivals_batch(&station_ifopts, 10, true)
+        info!(
+            count = station_ifopts.len(),
+            limit = efa_sync_config.limit_per_stop,
+            time_span_minutes = ?time_span,
+            fetch_arrivals = efa_sync_config.fetch_arrivals,
+            "Fetching departures for stations"
         );
+
+        // Fetch departures (always) and arrivals (if configured) concurrently
+        let departure_results = self
+            .efa_client
+            .get_departures_batch(
+                &station_ifopts,
+                efa_sync_config.limit_per_stop,
+                true,
+                time_span,
+            )
+            .await;
+
+        let arrival_results = if efa_sync_config.fetch_arrivals {
+            self.efa_client
+                .get_arrivals_batch(
+                    &station_ifopts,
+                    efa_sync_config.limit_per_stop,
+                    true,
+                    time_span,
+                )
+                .await
+        } else {
+            Vec::new()
+        };
 
         let mut success_count = 0;
         let mut error_count = 0;

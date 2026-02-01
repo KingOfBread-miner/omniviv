@@ -10,6 +10,62 @@ pub struct Config {
     /// Explicitly allow all origins (development only). Defaults to false.
     #[serde(default)]
     pub cors_permissive: bool,
+    /// EFA API sync configuration
+    #[serde(default)]
+    pub efa_sync: EfaSyncConfig,
+}
+
+/// Configuration for EFA API departure sync
+#[derive(Debug, Clone, Deserialize)]
+pub struct EfaSyncConfig {
+    /// Interval in seconds between departure sync cycles (default: 60)
+    #[serde(default = "EfaSyncConfig::default_interval_secs")]
+    pub interval_secs: u64,
+    /// Maximum number of departures/arrivals to fetch per stop (default: 30)
+    #[serde(default = "EfaSyncConfig::default_limit_per_stop")]
+    pub limit_per_stop: u32,
+    /// Time span in minutes to query departures for (default: 60)
+    /// A larger time span means each request returns more events,
+    /// reducing the need for frequent polling.
+    #[serde(default = "EfaSyncConfig::default_time_span_minutes")]
+    pub time_span_minutes: u32,
+    /// Maximum concurrent requests to the EFA API (default: 10)
+    #[serde(default = "EfaSyncConfig::default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    /// Whether to also fetch arrivals in addition to departures (default: true)
+    /// Disabling this halves the number of API requests.
+    #[serde(default = "EfaSyncConfig::default_fetch_arrivals")]
+    pub fetch_arrivals: bool,
+}
+
+impl Default for EfaSyncConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: Self::default_interval_secs(),
+            limit_per_stop: Self::default_limit_per_stop(),
+            time_span_minutes: Self::default_time_span_minutes(),
+            max_concurrent_requests: Self::default_max_concurrent_requests(),
+            fetch_arrivals: Self::default_fetch_arrivals(),
+        }
+    }
+}
+
+impl EfaSyncConfig {
+    fn default_interval_secs() -> u64 {
+        60
+    }
+    fn default_limit_per_stop() -> u32 {
+        30
+    }
+    fn default_time_span_minutes() -> u32 {
+        60
+    }
+    fn default_max_concurrent_requests() -> usize {
+        10
+    }
+    fn default_fetch_arrivals() -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

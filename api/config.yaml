@@ -22,3 +22,19 @@ areas:
     transport_types:
       - tram
       # - bus  # Disabled temporarily - too many stops overwhelm Overpass API
+
+# EFA API departure sync configuration
+# Controls how often and how much data is fetched from the EFA API.
+# Higher limit/timeSpan with longer interval = fewer requests but same coverage.
+efa_sync:
+  # Seconds between departure sync cycles (default: 60)
+  interval_secs: 60
+  # Max departures/arrivals per stop per request (default: 30)
+  limit_per_stop: 30
+  # Time window in minutes to query (default: 60)
+  # Larger values return more events per request, reducing polling frequency needs.
+  time_span_minutes: 60
+  # Max concurrent EFA API requests (default: 10)
+  max_concurrent_requests: 10
+  # Also fetch arrivals (doubles request count if true) (default: true)
+  fetch_arrivals: true
