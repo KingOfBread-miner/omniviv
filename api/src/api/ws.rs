@@ -5,21 +5,25 @@ use axum::{
     },
     response::IntoResponse,
 };
+use chrono::{DateTime, Duration, Utc};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 
 use super::vehicles::{Vehicle, VehicleStop};
-use crate::sync::{DepartureStore, EfaRequestSender, EventType, VehicleUpdateSender};
+use crate::providers::timetables::gtfs::realtime;
+use crate::sync::{DepartureStore, EventType, ScheduleStore, VehicleUpdateSender};
 
 #[derive(Clone)]
 pub struct WsState {
     pub pool: SqlitePool,
     pub departure_store: DepartureStore,
+    pub schedule_store: ScheduleStore,
+    pub time_horizon_minutes: u32,
+    pub timezone: chrono_tz::Tz,
     pub vehicle_updates_tx: VehicleUpdateSender,
 }
 
@@ -29,7 +33,11 @@ pub struct WsState {
 #[serde(rename_all = "snake_case")]
 enum ClientMessage {
     /// Subscribe to specific routes
-    Subscribe { route_ids: Vec<i64> },
+    Subscribe {
+        route_ids: Vec<i64>,
+        /// Optional reference time for time simulation (ISO 8601/RFC 3339)
+        reference_time: Option<String>,
+    },
 }
 
 /// Server message sent to clients
@@ -172,25 +180,28 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     }
 
     // Channel to communicate subscriptions from receiver task to sender task
-    let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<Vec<i64>>(16);
+    let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<(Vec<i64>, Option<String>)>(16);
 
     // Clone state for the forward task
     let forward_state = state.clone();
+
+    let mut simulated_time: Option<DateTime<Utc>> = None;
 
     // Spawn task to forward broadcast updates to WebSocket
     let forward_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 // Handle subscription updates
-                Some(route_ids) = sub_rx.recv() => {
-                    subscribed_routes = route_ids.into_iter().collect();
+                Some((route_ids, ref_time)) = sub_rx.recv() => {
+                    subscribed_routes = route_ids.iter().copied().collect();
+                    simulated_time = parse_ws_reference_time(&ref_time);
                     // Reset previous state when subscription changes
                     previous_state = PreviousState::default();
 
                     // Send full data for newly subscribed routes
                     if !subscribed_routes.is_empty() {
                         let routes: Vec<i64> = subscribed_routes.iter().copied().collect();
-                        match build_vehicle_data(&forward_state.pool, &forward_state.departure_store, &routes).await {
+                        match build_vehicle_data(&forward_state, &routes, simulated_time).await {
                             Ok(data) => {
                                 // Initialize previous state with current data
                                 for route in &data {
@@ -223,8 +234,12 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
                             if subscribed_routes.is_empty() {
                                 continue;
                             }
+                            // For simulated time, skip broadcast updates (schedule data doesn't change)
+                            if simulated_time.is_some() {
+                                continue;
+                            }
                             let routes: Vec<i64> = subscribed_routes.iter().copied().collect();
-                            match build_vehicle_data(&forward_state.pool, &forward_state.departure_store, &routes).await {
+                            match build_vehicle_data(&forward_state, &routes, None).await {
                                 Ok(data) => {
                                     // Compute changes from previous state
                                     let changes = compute_changes(&mut previous_state, &data);
@@ -258,8 +273,8 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
             Ok(Message::Text(text)) => {
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                     match client_msg {
-                        ClientMessage::Subscribe { route_ids } => {
-                            let _ = sub_tx.send(route_ids).await;
+                        ClientMessage::Subscribe { route_ids, reference_time } => {
+                            let _ = sub_tx.send((route_ids, reference_time)).await;
                         }
                     }
                 }
@@ -293,9 +308,9 @@ struct RouteStopInfo {
 
 /// Build vehicle data for the given routes
 async fn build_vehicle_data(
-    pool: &SqlitePool,
-    departure_store: &DepartureStore,
+    state: &WsState,
     route_ids: &[i64],
+    simulated_time: Option<DateTime<Utc>>,
 ) -> Result<Vec<RouteVehicles>, String> {
     let mut results = Vec::new();
 
@@ -305,7 +320,7 @@ async fn build_vehicle_data(
             "SELECT ref as line_ref FROM routes WHERE osm_id = ?",
         )
         .bind(route_id)
-        .fetch_optional(pool)
+        .fetch_optional(&state.pool)
         .await
         .map_err(|e| format!("Database error: {}", e))?;
 
@@ -332,7 +347,7 @@ async fn build_vehicle_data(
             "#,
         )
         .bind(route_id)
-        .fetch_all(pool)
+        .fetch_all(&state.pool)
         .await
         .map_err(|e| format!("Database error: {}", e))?;
 
@@ -358,9 +373,43 @@ async fn build_vehicle_data(
             continue;
         }
 
-        // Get departures from store
-        let trip_departures: HashMap<String, Vec<crate::sync::Departure>> = {
-            let store = departure_store.read().await;
+        // Get departures either from store (real-time) or schedule (simulated time)
+        let trip_departures: HashMap<String, Vec<crate::sync::Departure>> = if let Some(ref_time) = simulated_time {
+            let schedule_guard = state.schedule_store.read().await;
+            match schedule_guard.as_ref() {
+                Some(schedule) => {
+                    let stop_ids: HashSet<String> = stop_ifopts.iter().map(|s| s.to_string()).collect();
+                    let time_horizon = Duration::minutes(state.time_horizon_minutes as i64);
+                    let all_departures = realtime::compute_schedule_departures(
+                        schedule,
+                        &stop_ids,
+                        ref_time,
+                        time_horizon,
+                        state.timezone,
+                    );
+                    let mut result: HashMap<String, Vec<crate::sync::Departure>> = HashMap::new();
+                    for ifopt in &stop_ifopts {
+                        if let Some(departures) = all_departures.get(*ifopt) {
+                            for dep in departures {
+                                let trip_id = match &dep.trip_id {
+                                    Some(id) => id,
+                                    None => continue,
+                                };
+                                if let Some(ref line_ref) = route_info.line_ref {
+                                    if &dep.line_number != line_ref {
+                                        continue;
+                                    }
+                                }
+                                result.entry(trip_id.clone()).or_default().push(dep.clone());
+                            }
+                        }
+                    }
+                    result
+                }
+                None => HashMap::new(),
+            }
+        } else {
+            let store = state.departure_store.read().await;
             let mut result: HashMap<String, Vec<crate::sync::Departure>> = HashMap::new();
 
             for ifopt in &stop_ifopts {
@@ -470,160 +519,17 @@ async fn build_vehicle_data(
     Ok(results)
 }
 
-// ============================================================================
-// Backend Diagnostics WebSocket
-// ============================================================================
+/// Parse a reference_time string from a WebSocket message.
+fn parse_ws_reference_time(reference_time: &Option<String>) -> Option<DateTime<Utc>> {
+    let rt = reference_time.as_ref()?;
+    let parsed = DateTime::parse_from_rfc3339(rt).ok()?;
+    let dt = parsed.with_timezone(&Utc);
 
-use std::time::Instant;
-
-/// Rolling window for tracking request statistics
-struct RequestStats {
-    /// Timestamps and durations of recent requests (last 60 seconds)
-    recent_requests: VecDeque<(Instant, u64, bool)>, // (timestamp, duration_ms, is_error)
-}
-
-impl RequestStats {
-    fn new() -> Self {
-        Self {
-            recent_requests: VecDeque::new(),
-        }
+    // If the reference time is within 3 minutes of now, treat it as real-time
+    let diff = (dt - Utc::now()).num_seconds().abs();
+    if diff < 180 {
+        return None;
     }
-
-    fn record(&mut self, duration_ms: u64, is_error: bool) {
-        let now = Instant::now();
-        self.recent_requests.push_back((now, duration_ms, is_error));
-        self.cleanup();
-    }
-
-    fn cleanup(&mut self) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(60);
-        while let Some((ts, _, _)) = self.recent_requests.front() {
-            if *ts < cutoff {
-                self.recent_requests.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn get_stats(&mut self) -> (u32, f64, u32) {
-        self.cleanup();
-
-        let total = self.recent_requests.len() as u32;
-        let errors = self.recent_requests.iter().filter(|(_, _, e)| *e).count() as u32;
-
-        let avg_latency = if total > 0 {
-            let sum: u64 = self.recent_requests.iter().map(|(_, d, _)| *d).sum();
-            sum as f64 / total as f64
-        } else {
-            0.0
-        };
-
-        (total, avg_latency, errors)
-    }
+    Some(dt)
 }
 
-/// State for backend diagnostics WebSocket
-#[derive(Clone)]
-pub struct DiagnosticsWsState {
-    stats: Arc<RwLock<RequestStats>>,
-}
-
-impl DiagnosticsWsState {
-    pub fn new(efa_requests_tx: EfaRequestSender) -> Self {
-        let stats = Arc::new(RwLock::new(RequestStats::new()));
-
-        // Spawn a task to collect statistics from EFA requests
-        let stats_clone = stats.clone();
-        let mut rx = efa_requests_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(log) => {
-                        let mut stats = stats_clone.write().await;
-                        stats.record(log.duration_ms, log.error.is_some());
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        });
-
-        Self { stats }
-    }
-}
-
-/// EFA API statistics
-#[derive(Debug, Serialize)]
-struct EfaStats {
-    /// Requests in the last 60 seconds
-    requests_per_minute: u32,
-    /// Average latency in milliseconds
-    avg_latency_ms: f64,
-    /// Number of errors in the last 60 seconds
-    errors_per_minute: u32,
-}
-
-/// Server message for backend diagnostics
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-enum DiagnosticsServerMessage {
-    /// Periodic statistics update
-    Stats { efa: EfaStats },
-}
-
-/// WebSocket endpoint for backend diagnostics
-pub async fn ws_backend_diagnostics(
-    ws: WebSocketUpgrade,
-    State(state): State<DiagnosticsWsState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_diagnostics_socket(socket, state))
-}
-
-async fn handle_diagnostics_socket(socket: WebSocket, state: DiagnosticsWsState) {
-    let (mut sender, mut receiver) = socket.split();
-
-    // Send stats every second
-    let stats = state.stats.clone();
-    let forward_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-
-        loop {
-            interval.tick().await;
-
-            let (requests_per_minute, avg_latency_ms, errors_per_minute) = {
-                let mut stats = stats.write().await;
-                stats.get_stats()
-            };
-
-            let msg = DiagnosticsServerMessage::Stats {
-                efa: EfaStats {
-                    requests_per_minute,
-                    avg_latency_ms,
-                    errors_per_minute,
-                },
-            };
-
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if sender.send(Message::Text(json.into())).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
-
-    // Handle incoming messages (just wait for close)
-    while let Some(msg) = receiver.next().await {
-        match msg {
-            Ok(Message::Ping(_)) => {
-                // Axum handles pong automatically
-            }
-            Ok(Message::Close(_)) => break,
-            Err(_) => break,
-            _ => {}
-        }
-    }
-
-    forward_task.abort();
-}

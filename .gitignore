@@ -10,3 +10,7 @@
 
 # Deployment data (map tiles, fonts, etc.)
 deployment/data/
+
+# Planning files
+plan.md
+TODO.md

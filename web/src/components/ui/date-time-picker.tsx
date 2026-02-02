@@ -7,7 +7,8 @@ interface DateTimePickerProps {
 }
 
 export function DateTimePicker({ value, onChange }: DateTimePickerProps) {
-    const dateStr = value.toISOString().split("T")[0];
+    // Use local date components (not toISOString() which gives UTC and can show wrong date near midnight)
+    const dateStr = `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
     const timeStr = value.toTimeString().slice(0, 5);
 
     const handleDateChange = (e: React.ChangeEvent<HTMLInputElement>) => {

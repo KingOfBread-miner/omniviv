@@ -114,7 +114,7 @@ Returns all upcoming departures across all stops.
             "estimated_time": "2024-01-15T10:31:00+01:00",
             "delay_minutes": 1,
             "event_type": "departure",
-            "trip_id": "avms-12345"
+            "trip_id": "123456789-1"
         }
     ]
 }
@@ -165,7 +165,7 @@ Returns all vehicles currently operating on a route with their stop sequences.
     "line_number": "1",
     "vehicles": [
         {
-            "trip_id": "avms-12345",
+            "trip_id": "123456789-1",
             "line_number": "1",
             "destination": "Lechhausen",
             "origin": "Haunstetten Nord",
@@ -231,7 +231,7 @@ Real-time vehicle position updates.
     "type": "vehicle_update",
     "vehicles": [
         {
-            "trip_id": "avms-12345",
+            "trip_id": "123456789-1",
             "line_number": "1",
             "position": {"lat": 48.3657, "lon": 10.8945},
             "heading": 45.0,
@@ -240,13 +240,6 @@ Real-time vehicle position updates.
     ]
 }
 ```
-
-### Backend Diagnostics
-```
-WS /api/ws/backend-diagnostics
-```
-
-Debug stream of EFA API requests and responses.
 
 ---
 

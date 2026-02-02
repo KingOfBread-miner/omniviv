@@ -22,3 +22,19 @@ areas:
     transport_types:
       - tram
       # - bus  # Disabled temporarily - too many stops overwhelm Overpass API
+
+# GTFS departure sync configuration
+# Uses static GTFS schedule data + GTFS-RT realtime feed from gtfs.de
+gtfs_sync:
+  # URL for the static GTFS zip (all German local transit)
+  static_feed_url: "https://download.gtfs.de/germany/free/latest.zip"
+  # URL for the GTFS-RT protobuf feed (TripUpdates + TripAlerts)
+  realtime_feed_url: "https://realtime.gtfs.de/realtime-free.pb"
+  # Local cache directory for the static GTFS zip
+  cache_dir: "./data/gtfs"
+  # How often to re-download static GTFS data (hours)
+  static_refresh_hours: 24
+  # How often to poll the GTFS-RT feed (seconds, feed updates every ~10s)
+  realtime_interval_secs: 15
+  # Only show departures up to this many minutes in the future
+  time_horizon_minutes: 120

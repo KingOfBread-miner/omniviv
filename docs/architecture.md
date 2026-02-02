@@ -21,7 +21,7 @@ Omniviv is a real-time public transport visualization platform consisting of thr
                          ┌──────┴──────┐
                          │  External   │
                          │    APIs     │
-                         │ (EFA, OSM)  │
+                         │(GTFS-RT,OSM)│
                          └─────────────┘
 ```
 
@@ -64,8 +64,11 @@ api/src/
 ├── providers/          # External data sources
 │   ├── osm.rs          # OpenStreetMap data fetching
 │   └── timetables/     # Timetable API integrations
-│       └── germany/
-│           └── bavaria.rs  # EFA Bavaria API
+│       └── gtfs/
+│           ├── mod.rs         # GtfsProvider (schedule + RT)
+│           ├── static_data.rs # GTFS ZIP download/parsing
+│           ├── realtime.rs    # GTFS-RT protobuf processing
+│           └── error.rs       # GTFS error types
 ├── sync/               # Background synchronization
 │   ├── mod.rs          # SyncManager orchestration
 │   ├── types.rs        # Shared types (Departure, etc.)
@@ -90,10 +93,12 @@ api/src/
 4. Frontend renders map with stations and routes
 
 ### Real-time Updates
-1. SyncManager fetches departures from EFA API every 30 seconds
-2. Vehicle positions are calculated from departure times
-3. Updates broadcast via WebSocket (`/api/ws/vehicles`)
-4. Frontend interpolates vehicle positions between updates
+1. SyncManager loads static GTFS schedule on startup (downloaded ZIP, cached on disk)
+2. GTFS-RT protobuf feed is polled every 15 seconds for real-time trip updates
+3. Schedule-only departures are generated for trips without RT data
+4. Vehicle positions are calculated from departure/arrival times
+5. Updates broadcast via WebSocket (`/api/ws/vehicles`)
+6. Frontend interpolates vehicle positions between updates
 
 ### OSM Data Sync
 1. On startup, API fetches transit data from Overpass API
@@ -104,9 +109,6 @@ api/src/
 
 ### `/api/ws/vehicles`
 Real-time vehicle position updates for the map.
-
-### `/api/ws/backend-diagnostics`
-Debug channel showing EFA API request/response logs.
 
 ## Database Schema
 
@@ -134,6 +136,14 @@ areas:
           east: 11.05
       transport_types:
           - tram
+
+gtfs_sync:
+    static_feed_url: "https://download.gtfs.de/germany/free/latest.zip"
+    realtime_feed_url: "https://realtime.gtfs.de/realtime-free.pb"
+    cache_dir: "./data/gtfs"
+    static_refresh_hours: 24
+    realtime_interval_secs: 15
+    time_horizon_minutes: 120
 ```
 
 ### Frontend (`config.json`)

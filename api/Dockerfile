@@ -47,8 +47,8 @@ RUN if [ "${PROFILE}" = "release" ]; then upx --best --lzma /${BINARY_NAME}; fi
 
 RUN useradd -u 50003 -N ${SERVICE_NAME}
 
-# Create database directory with correct ownership
-RUN mkdir -p /app/database && chown ${SERVICE_NAME}:users /app/database
+# Create data directories with correct ownership
+RUN mkdir -p /app/database /app/data/gtfs && chown -R ${SERVICE_NAME}:users /app/database /app/data
 
 # Final stage
 FROM scratch
@@ -61,6 +61,7 @@ WORKDIR /app
 COPY --from=builder /${BINARY_NAME} ./api
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder --chown=50003:users /app/database /app/database
+COPY --from=builder --chown=50003:users /app/data /app/data
 COPY migrations migrations
 COPY static static
 

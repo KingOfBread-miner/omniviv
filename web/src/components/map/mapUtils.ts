@@ -10,8 +10,15 @@ export function getPlatformDisplayName(platform: StationPlatform | StationStopPo
     return "?";
 }
 
-// Format time from ISO string to HH:MM:SS
+// Internationalized time formatter using browser default locale
+const timeFormatter = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+});
+
+// Format time from ISO string using the browser's locale
 export function formatTime(isoString: string): string {
     const date = new Date(isoString);
-    return date.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    return timeFormatter.format(date);
 }

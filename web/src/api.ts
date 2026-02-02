@@ -58,7 +58,7 @@ export interface Departure {
   planned_time: string;
   platform?: string | null;
   stop_ifopt: string;
-  /** Unique trip identifier (AVMSTripID) - consistent across all stops for a journey */
+  /** Unique trip identifier (GTFS trip_id) - consistent across all stops for a journey */
   trip_id?: string | null;
 }
 
@@ -100,17 +100,17 @@ export interface OsmIssue {
   osm_url: string;
   /** The ref tag value (e.g., platform letter "a", "b") */
   ref?: string | null;
-  /** Suggested IFOPT from EFA API (for missing_ifopt issues) */
+  /** Suggested IFOPT (for missing_ifopt issues) */
   suggested_ifopt?: string | null;
   /**
-   * Distance in meters to the suggested EFA stop
+   * Distance in meters to the suggested stop
    * @format int32
    * @min 0
    */
   suggested_ifopt_distance?: number | null;
-  /** Name of the EFA stop that was matched */
+  /** Name of the stop that was matched */
   suggested_ifopt_name?: string | null;
-  /** Transport type for filtering issues */
+  /** Transport type for both configuration and runtime detection */
   transport_type: TransportType;
 }
 
@@ -215,6 +215,12 @@ export interface StationStopPosition {
 }
 
 export interface StopDeparturesRequest {
+  /**
+   * Optional reference time (ISO 8601/RFC 3339) for time simulation.
+   * When provided, departures are computed from the static GTFS schedule
+   * around this time instead of using live real-time data.
+   */
+  reference_time?: string | null;
   stop_ifopt: string;
 }
 
@@ -223,11 +229,13 @@ export interface StopDeparturesResponse {
   stop_ifopt: string;
 }
 
-/** Transport type for filtering issues */
+/** Transport type for both configuration and runtime detection */
 export enum TransportType {
   Tram = "tram",
   Bus = "bus",
+  Subway = "subway",
   Train = "train",
+  Ferry = "ferry",
   Unknown = "unknown",
 }
 
@@ -240,7 +248,7 @@ export interface Vehicle {
   origin?: string | null;
   /** All stops this vehicle will visit, in order */
   stops: VehicleStop[];
-  /** Unique trip identifier (AVMSTripID from EFA) */
+  /** Unique trip identifier (GTFS trip_id) */
   trip_id: string;
 }
 
@@ -280,6 +288,11 @@ export interface VehicleStop {
 }
 
 export interface VehiclesByRouteRequest {
+  /**
+   * Optional reference time (ISO 8601/RFC 3339) for time simulation.
+   * When provided, departures are computed from the static GTFS schedule.
+   */
+  reference_time?: string | null;
   /**
    * The OSM route ID to get vehicles for
    * @format int64

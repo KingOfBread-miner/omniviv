@@ -35,6 +35,7 @@ use sync::SyncManager;
         api::departures::get_departures_by_stop,
         api::vehicles::get_vehicles_by_route,
         api::issues::list_issues,
+        api::health::health_check,
     ),
     components(schemas(
         api::areas::list::Area,
@@ -58,6 +59,7 @@ use sync::SyncManager;
         api::vehicles::Vehicle,
         api::vehicles::VehicleStop,
         api::issues::IssueListResponse,
+        api::health::HealthResponse,
         sync::Departure,
         sync::EventType,
         sync::OsmIssue,
@@ -69,7 +71,8 @@ use sync::SyncManager;
         (name = "stations", description = "Station and platform endpoints"),
         (name = "departures", description = "Real-time departure information"),
         (name = "vehicles", description = "Live vehicle tracking"),
-        (name = "issues", description = "OSM data quality issues")
+        (name = "issues", description = "OSM data quality issues"),
+        (name = "health", description = "Service health check")
     )
 )]
 struct ApiDoc;
@@ -87,6 +90,7 @@ async fn main() {
 
     // Load config
     let config = Config::load("config.yaml").expect("Failed to load config");
+    config.gtfs_sync.validate();
     tracing::info!(areas = config.areas.len(), "Loaded configuration");
 
     // Build CORS layer based on config
@@ -140,9 +144,11 @@ async fn main() {
         SyncManager::new(pool.clone(), config).expect("Failed to initialize sync manager"),
     );
     let departure_store = sync_manager.departure_store();
+    let schedule_store = sync_manager.schedule_store();
+    let time_horizon_minutes = sync_manager.time_horizon_minutes();
+    let timezone = sync_manager.timezone();
     let issue_store = sync_manager.issue_store();
     let vehicle_updates_tx = sync_manager.vehicle_updates_sender();
-    let efa_requests_tx = sync_manager.efa_requests_sender();
     let sync_manager_clone = sync_manager.clone();
     tokio::spawn(async move {
         sync_manager_clone.start().await;
@@ -152,7 +158,7 @@ async fn main() {
     #[allow(unused_mut)] // mut needed when dev-tools feature is enabled
     let mut app = Router::new()
         .route("/", get(root))
-        .nest("/api", api::router(pool.clone(), departure_store, issue_store, vehicle_updates_tx, efa_requests_tx))
+        .nest("/api", api::router(pool.clone(), departure_store, schedule_store, time_horizon_minutes, timezone, issue_store, vehicle_updates_tx))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
