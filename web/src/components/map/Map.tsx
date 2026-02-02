@@ -191,6 +191,7 @@ export default class Map extends React.Component<MapProps, MapState> {
             // Update simulated time reference for vehicle position calculations
             if (prevProps.simulatedTime !== this.props.simulatedTime) {
                 this.vehicleRenderer?.setSimulatedTime(this.props.simulatedTime);
+                this.vehicleTracker?.setSimulatedTime(this.props.simulatedTime);
             }
         }
 
@@ -473,7 +474,7 @@ export default class Map extends React.Component<MapProps, MapState> {
             if (station) {
                 const handlePlatformClick = (platform: StationPlatform | StationStopPosition) => {
                     const platformCoords: [number, number] = [platform.lon, platform.lat];
-                    this.showPopup(platformCoords, <PlatformPopup platform={platform} stationName={station.name ?? undefined} routeColors={this.routeColors} />);
+                    this.showPopup(platformCoords, <PlatformPopup platform={platform} stationName={station.name ?? undefined} routeColors={this.routeColors} referenceTime={this.props.simulatedTime} />);
                 };
                 this.showPopup(coordinates, <StationPopup station={station} onPlatformClick={handlePlatformClick} />);
             }
@@ -489,12 +490,12 @@ export default class Map extends React.Component<MapProps, MapState> {
             for (const station of this.props.stations) {
                 const platform = station.platforms.find((p) => p.osm_id === osmId);
                 if (platform) {
-                    this.showPopup(coordinates, <PlatformPopup platform={platform} stationName={stationName} routeColors={this.routeColors} />);
+                    this.showPopup(coordinates, <PlatformPopup platform={platform} stationName={stationName} routeColors={this.routeColors} referenceTime={this.props.simulatedTime} />);
                     return;
                 }
                 const stopPosition = station.stop_positions.find((s) => s.osm_id === osmId);
                 if (stopPosition) {
-                    this.showPopup(coordinates, <PlatformPopup platform={stopPosition} stationName={stationName} routeColors={this.routeColors} />);
+                    this.showPopup(coordinates, <PlatformPopup platform={stopPosition} stationName={stationName} routeColors={this.routeColors} referenceTime={this.props.simulatedTime} />);
                     return;
                 }
             }

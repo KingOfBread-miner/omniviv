@@ -4,6 +4,9 @@
 {{- if and .services.api.database.storage.volumeName .services.api.database.storage.absolutePath -}}
 {{- fail "Cannot specify both volumeName and absolutePath for api database storage" -}}
 {{- end -}}
+{{- if and .services.api.data.storage.volumeName .services.api.data.storage.absolutePath -}}
+{{- fail "Cannot specify both volumeName and absolutePath for api data storage" -}}
+{{- end -}}
 
 services:
     api:
@@ -23,6 +26,13 @@ services:
             {{- else if .services.api.database.storage.absolutePath }}
             - {{ .services.api.database.storage.absolutePath }}:/app/database
             {{- end }}
+            {{- if .services.api.data.storage.volumeName }}
+            - {{ .services.api.data.storage.volumeName }}:/app/data
+            {{- else if .services.api.data.storage.absolutePath }}
+            - {{ .services.api.data.storage.absolutePath }}:/app/data
+            {{- end }}
+        mem_limit: 2g
+        cpus: 2
         networks:
             - {{ .reverseProxy.network }}
         labels:
@@ -146,9 +156,14 @@ services:
             - /var/run/docker.sock:/var/run/docker.sock:ro
     {{- end }}
 
-{{- if .services.api.database.storage.volumeName }}
+{{- if or .services.api.database.storage.volumeName .services.api.data.storage.volumeName }}
 volumes:
+    {{- if .services.api.database.storage.volumeName }}
     {{ .services.api.database.storage.volumeName }}:
+    {{- end }}
+    {{- if .services.api.data.storage.volumeName }}
+    {{ .services.api.data.storage.volumeName }}:
+    {{- end }}
 {{- end }}
 
 networks:

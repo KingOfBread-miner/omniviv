@@ -121,6 +121,8 @@ function applyChanges(current: RouteVehicles[], changes: VehicleChange[]): Route
 interface UseVehicleUpdatesOptions {
     enabled: boolean;
     routeIds: number[];
+    /** Optional reference time for time simulation (ISO 8601 string) */
+    referenceTime?: string;
     /** Called with full vehicle data on initial subscribe */
     onFullData: (routes: RouteVehicles[]) => void;
     /** Called with the updated state after applying incremental changes */
@@ -137,6 +139,7 @@ interface UseVehicleUpdatesResult {
 export function useVehicleUpdates({
     enabled,
     routeIds,
+    referenceTime,
     onFullData,
     onIncrementalUpdate,
     onFallbackFetch,
@@ -157,15 +160,21 @@ export function useVehicleUpdates({
     onFallbackFetchRef.current = onFallbackFetch;
     const routeIdsRef = useRef(routeIds);
     routeIdsRef.current = routeIds;
+    const referenceTimeRef = useRef(referenceTime);
+    referenceTimeRef.current = referenceTime;
 
     // Send subscription when route IDs change
     const sendSubscription = useCallback(() => {
         const ws = wsRef.current;
         if (ws?.readyState === WebSocket.OPEN && routeIdsRef.current.length > 0) {
-            ws.send(JSON.stringify({
+            const msg: Record<string, unknown> = {
                 type: "subscribe",
                 route_ids: routeIdsRef.current,
-            }));
+            };
+            if (referenceTimeRef.current) {
+                msg.reference_time = referenceTimeRef.current;
+            }
+            ws.send(JSON.stringify(msg));
         }
     }, []);
 
@@ -276,12 +285,12 @@ export function useVehicleUpdates({
         };
     }, [enabled, connectWebSocket]);
 
-    // Effect to re-subscribe when route IDs change
+    // Effect to re-subscribe when route IDs or reference time change
     useEffect(() => {
         if (isConnected && routeIds.length > 0) {
             sendSubscription();
         }
-    }, [isConnected, routeIds, sendSubscription]);
+    }, [isConnected, routeIds, referenceTime, sendSubscription]);
 
     return { isConnected, usingWebSocket };
 }

@@ -213,10 +213,15 @@ export default function App() {
     const fetchVehiclesFallback = useCallback(async () => {
         if (routes.length === 0) return;
 
+        const refTime = timeSimulation.isRealTime ? undefined : timeSimulation.currentTime.toISOString();
+
         try {
             const vehiclePromises = routes.map(async (route) => {
                 try {
-                    const response = await getApi().api.getVehiclesByRoute({ route_id: route.osm_id });
+                    const response = await getApi().api.getVehiclesByRoute({
+                        route_id: route.osm_id,
+                        reference_time: refTime,
+                    });
                     return {
                         routeId: route.osm_id,
                         lineNumber: response.data.line_number ?? null,
@@ -236,7 +241,7 @@ export default function App() {
         } catch (err) {
             console.error("Failed to fetch vehicles:", err);
         }
-    }, [routes]);
+    }, [routes, timeSimulation.isRealTime, timeSimulation.currentTime]);
 
     // Handle full vehicle data from WebSocket (initial subscribe)
     const handleFullVehicleData = useCallback((data: RouteVehiclesData[]) => {
@@ -284,10 +289,17 @@ export default function App() {
     // Get route IDs for WebSocket subscription
     const routeIds = useMemo(() => routes.map(r => r.osm_id), [routes]);
 
+    // Compute reference time for simulated time (only when not in real-time mode)
+    const referenceTimeISO = useMemo(() => {
+        if (timeSimulation.isRealTime) return undefined;
+        return timeSimulation.currentTime.toISOString();
+    }, [timeSimulation.isRealTime, timeSimulation.currentTime]);
+
     // WebSocket-based vehicle updates with fallback to polling
     const { isConnected: wsConnected, usingWebSocket } = useVehicleUpdates({
         enabled: showVehicles && routes.length > 0,
         routeIds,
+        referenceTime: referenceTimeISO,
         onFullData: handleFullVehicleData,
         onIncrementalUpdate: handleIncrementalUpdate,
         onFallbackFetch: fetchVehiclesFallback,

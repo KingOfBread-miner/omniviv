@@ -1,54 +1,46 @@
-//! Background synchronization of OSM and EFA data.
+//! Background synchronization of OSM and GTFS data.
 //!
 //! This module handles:
 //! - Periodic synchronization of OSM transit data (stations, platforms, routes)
-//! - Real-time departure/arrival data from EFA API
-//! - OSM data quality issue detection and enrichment
+//! - Real-time departure/arrival data from GTFS-RT feed
+//! - OSM data quality issue detection
 
 mod issues;
 mod types;
 
 // Re-export types for API compatibility
 pub use issues::{determine_transport_type, transport_type_from_route, OsmIssue, OsmIssueStore, OsmIssueType};
-pub use types::{
-    Departure, DepartureStore, EfaRequestLog, EfaRequestSender, EventType, VehicleUpdate,
-    VehicleUpdateSender,
-};
+pub use types::{Departure, DepartureStore, EventType, ScheduleStore, VehicleUpdate, VehicleUpdateSender};
 
 use crate::config::{Area, Config, TransportType};
 use crate::providers::osm::{OsmClient, OsmElement, OsmRoute};
-use crate::providers::timetables::germany::bavaria::EfaClient;
-use chrono::{DateTime, Utc};
+use crate::providers::timetables::gtfs::GtfsProvider;
+use chrono::Utc;
 use sqlx::{Sqlite, SqlitePool, Transaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
-/// Manages background synchronization of OSM and EFA data
+/// Manages background synchronization of OSM and GTFS data
 pub struct SyncManager {
     pool: SqlitePool,
     osm_client: OsmClient,
-    efa_client: EfaClient,
+    gtfs_provider: GtfsProvider,
     config: Arc<RwLock<Config>>,
     departures: DepartureStore,
     issues: OsmIssueStore,
     vehicle_updates_tx: VehicleUpdateSender,
-    efa_requests_tx: EfaRequestSender,
+    time_horizon_minutes: u32,
 }
 
 impl SyncManager {
     pub fn new(pool: SqlitePool, config: Config) -> Result<Self, SyncError> {
         let osm_client = OsmClient::new().map_err(|e| SyncError::OsmError(e.to_string()))?;
 
-        // Create broadcast channel for EFA request diagnostics (capacity 100)
-        let (efa_requests_tx, _) = broadcast::channel(100);
+        let gtfs_provider = GtfsProvider::new(config.gtfs_sync.clone())?;
 
-        let efa_client = EfaClient::with_max_concurrent(
-            efa_requests_tx.clone(),
-            config.efa_sync.max_concurrent_requests,
-        )
-        .map_err(|e| SyncError::EfaError(e.to_string()))?;
+        let time_horizon_minutes = config.gtfs_sync.time_horizon_minutes;
 
         // Create broadcast channel for vehicle updates (capacity 16 - clients will get latest state anyway)
         let (vehicle_updates_tx, _) = broadcast::channel(16);
@@ -56,12 +48,12 @@ impl SyncManager {
         Ok(Self {
             pool,
             osm_client,
-            efa_client,
+            gtfs_provider,
             config: Arc::new(RwLock::new(config)),
             departures: Arc::new(RwLock::new(HashMap::new())),
             issues: Arc::new(RwLock::new(Vec::new())),
             vehicle_updates_tx,
-            efa_requests_tx,
+            time_horizon_minutes,
         })
     }
 
@@ -75,14 +67,24 @@ impl SyncManager {
         self.issues.clone()
     }
 
+    /// Get a reference to the GTFS schedule for API access (time simulation queries)
+    pub fn schedule_store(&self) -> ScheduleStore {
+        self.gtfs_provider.schedule()
+    }
+
+    /// Get the departure time horizon in minutes
+    pub fn time_horizon_minutes(&self) -> u32 {
+        self.time_horizon_minutes
+    }
+
+    /// Get the configured GTFS timezone
+    pub fn timezone(&self) -> chrono_tz::Tz {
+        self.gtfs_provider.timezone()
+    }
+
     /// Get the vehicle updates sender for passing to API handlers
     pub fn vehicle_updates_sender(&self) -> VehicleUpdateSender {
         self.vehicle_updates_tx.clone()
-    }
-
-    /// Get the EFA request sender for passing to diagnostics WebSocket
-    pub fn efa_requests_sender(&self) -> EfaRequestSender {
-        self.efa_requests_tx.clone()
     }
 
     /// Start the background sync loops
@@ -106,28 +108,170 @@ impl SyncManager {
             }
         });
 
-        // Spawn departure sync loop (configurable interval)
-        let efa_self = self.clone();
-        let efa_handle = tokio::spawn(async move {
-            // Wait a bit for initial OSM sync to complete
+        // Spawn GTFS sync loop
+        let gtfs_self = self.clone();
+        let gtfs_handle = tokio::spawn(async move {
+            // Wait for initial OSM sync to populate stops with IFOPTs
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-            let interval_secs = {
-                let config = efa_self.config.read().await;
-                config.efa_sync.interval_secs
-            };
-            info!(interval_secs, "Starting EFA departure sync loop");
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
-
-            loop {
-                interval.tick().await;
-                efa_self.sync_all_departures().await;
-            }
+            gtfs_self.run_gtfs_sync_loop().await;
         });
 
         // Wait for both loops (they run forever)
-        let _ = tokio::join!(osm_handle, efa_handle);
+        let _ = tokio::join!(osm_handle, gtfs_handle);
+    }
+
+    /// Load all stop IFOPTs with coordinates from the database for GTFS mapping
+    async fn load_stop_coords(&self) -> Vec<(String, f64, f64)> {
+        let rows: Vec<(String, f64, f64)> = match sqlx::query_as(
+            r#"
+            SELECT ref_ifopt, lat, lon FROM platforms WHERE ref_ifopt IS NOT NULL
+            UNION
+            SELECT ref_ifopt, lat, lon FROM stop_positions WHERE ref_ifopt IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!(error = %e, "Failed to fetch stop coordinates for GTFS mapping");
+                Vec::new()
+            }
+        };
+
+        rows
+    }
+
+    /// Build the IFOPT <-> GTFS stop ID mapping after schedule load
+    async fn build_gtfs_mapping(&self) {
+        let db_stops = self.load_stop_coords().await;
+        if db_stops.is_empty() {
+            warn!("No stop coordinates in DB, skipping GTFS mapping");
+            return;
+        }
+
+        let schedule_store = self.gtfs_provider.schedule();
+        let mut guard = schedule_store.write().await;
+        if let Some(schedule) = guard.as_mut() {
+            schedule.build_ifopt_mapping(&db_stops, 200.0);
+        }
+    }
+
+    /// Run the GTFS departure sync loop
+    async fn run_gtfs_sync_loop(&self) {
+        // Step 1: Load static GTFS schedule
+        info!("Loading static GTFS schedule...");
+        let mut retries = 0u64;
+        loop {
+            match self.gtfs_provider.refresh_static_schedule().await {
+                Ok(()) => break,
+                Err(e) => {
+                    retries += 1;
+                    // Cap backoff at 5 minutes
+                    let wait = (30 * retries).min(300);
+                    if retries <= 5 {
+                        error!(error = %e, retry = retries, wait_secs = wait, "Failed to load static GTFS, retrying...");
+                    } else {
+                        error!(error = %e, retry = retries, wait_secs = wait, "Failed to load static GTFS after {} retries, will keep retrying...", retries);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+                }
+            }
+        }
+
+        // Step 1b: Build IFOPT <-> GTFS stop mapping
+        self.build_gtfs_mapping().await;
+
+        let config = self.config.read().await;
+        let rt_interval_secs = config.gtfs_sync.realtime_interval_secs;
+        let static_refresh_hours = config.gtfs_sync.static_refresh_hours;
+        drop(config);
+
+        info!(
+            realtime_interval_secs = rt_interval_secs,
+            static_refresh_hours,
+            "Starting GTFS sync loops"
+        );
+
+        let mut rt_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(rt_interval_secs));
+        let mut static_refresh_interval = tokio::time::interval(
+            tokio::time::Duration::from_secs(static_refresh_hours * 3600),
+        );
+        // Skip first tick (we already loaded)
+        static_refresh_interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = rt_interval.tick() => {
+                    self.sync_departures_gtfs().await;
+                }
+                _ = static_refresh_interval.tick() => {
+                    info!("Refreshing static GTFS schedule...");
+                    if let Err(e) = self.gtfs_provider.refresh_static_schedule().await {
+                        error!(error = %e, "Failed to refresh static GTFS schedule");
+                    } else {
+                        // Rebuild IFOPT mapping after schedule refresh
+                        self.build_gtfs_mapping().await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fetch GTFS-RT departures and update the store
+    async fn sync_departures_gtfs(&self) {
+        // Collect relevant stop IFOPTs from DB
+        let relevant_stops = match self.load_relevant_stop_ids().await {
+            Ok(stops) => stops,
+            Err(e) => {
+                error!(error = %e, "Failed to load relevant stop IDs");
+                return;
+            }
+        };
+        if relevant_stops.is_empty() {
+            return;
+        }
+
+        match self.gtfs_provider.fetch_departures(&relevant_stops).await {
+            Ok(new_departures) => {
+                let total_events: usize = new_departures.values().map(|v| v.len()).sum();
+                let total_stops = new_departures.len();
+
+                let mut store = self.departures.write().await;
+                *store = new_departures;
+                drop(store);
+
+                // Broadcast vehicle update notification
+                let update = VehicleUpdate {
+                    timestamp: Utc::now().to_rfc3339(),
+                    is_initial: false,
+                };
+                let _ = self.vehicle_updates_tx.send(update);
+
+                info!(stops = total_stops, events = total_events, "Completed GTFS-RT departure sync");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to sync GTFS-RT departures, keeping existing data");
+            }
+        }
+    }
+
+    /// Load all unique stop IFOPTs from the database
+    async fn load_relevant_stop_ids(&self) -> Result<HashSet<String>, SyncError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ref_ifopt FROM stations WHERE ref_ifopt IS NOT NULL
+            UNION
+            SELECT DISTINCT ref_ifopt FROM platforms WHERE ref_ifopt IS NOT NULL
+            UNION
+            SELECT DISTINCT ref_ifopt FROM stop_positions WHERE ref_ifopt IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(ifopt,)| ifopt).collect())
     }
 
     /// Sync all areas from config
@@ -162,220 +306,6 @@ impl SyncManager {
                 }
             }
         }
-
-        // After all areas are synced, enrich missing IFOPT issues with EFA suggestions
-        self.enrich_issues_with_efa_suggestions().await;
-    }
-
-    /// Enrich missing IFOPT issues with suggested IFOPTs from EFA API
-    async fn enrich_issues_with_efa_suggestions(&self) {
-        let mut issues = self.issues.write().await;
-
-        // Find all missing IFOPT issues with coordinates
-        let missing_ifopt_indices: Vec<usize> = issues
-            .iter()
-            .enumerate()
-            .filter(|(_, issue)| {
-                matches!(issue.issue_type, OsmIssueType::MissingIfopt)
-                    && issue.lat.is_some()
-                    && issue.lon.is_some()
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        if missing_ifopt_indices.is_empty() {
-            return;
-        }
-
-        info!(
-            count = missing_ifopt_indices.len(),
-            "Enriching missing IFOPT issues with EFA suggestions"
-        );
-
-        // Process each issue and query EFA
-        for idx in missing_ifopt_indices {
-            let issue = &issues[idx];
-            let lat = issue.lat.unwrap();
-            let lon = issue.lon.unwrap();
-            let osm_name = issue.name.clone();
-            let element_type = issue.element_type.clone();
-
-            // Query EFA for nearby stops (200m radius)
-            match self.efa_client.find_stops_by_coord(lon, lat, 200).await {
-                Ok(response) => {
-                    // For platforms and stop_positions, try to get platform-level IFOPT
-                    if element_type == "platform" || element_type == "stop_position" {
-                        if let Some(suggestion) = self.find_platform_ifopt_match(&response.locations, &osm_name).await {
-                            issues[idx].suggested_ifopt = Some(suggestion.0);
-                            issues[idx].suggested_ifopt_name = suggestion.1;
-                            issues[idx].suggested_ifopt_distance = suggestion.2;
-                            continue;
-                        }
-                    }
-
-                    // Fallback to station-level IFOPT
-                    if let Some(suggestion) = self.find_station_ifopt_match(&response.locations, &osm_name) {
-                        issues[idx].suggested_ifopt = Some(suggestion.0);
-                        issues[idx].suggested_ifopt_name = suggestion.1;
-                        issues[idx].suggested_ifopt_distance = suggestion.2;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        osm_id = issue.osm_id,
-                        error = %e,
-                        "Failed to query EFA for IFOPT suggestion"
-                    );
-                }
-            }
-
-            // Small delay to avoid overwhelming the EFA API
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-
-        let enriched_count = issues
-            .iter()
-            .filter(|i| i.suggested_ifopt.is_some())
-            .count();
-        info!(
-            enriched = enriched_count,
-            total = issues.len(),
-            "Finished enriching issues with EFA suggestions"
-        );
-    }
-
-    /// Find platform-level IFOPT by querying departures for nearby stations
-    /// Returns (ifopt, name, distance) if a good match is found
-    async fn find_platform_ifopt_match(
-        &self,
-        stations: &[crate::providers::timetables::germany::bavaria::CoordLocation],
-        osm_name: &Option<String>,
-    ) -> Option<(String, Option<String>, Option<u32>)> {
-        if stations.is_empty() {
-            return None;
-        }
-
-        // Extract platform ref from OSM name if present (e.g., "a", "b", "1", "2")
-        let osm_ref = osm_name.as_ref().and_then(|name| {
-            // Look for patterns like "Bstg. a", "Platform a", or just single letter/number at end
-            let name_lower = name.to_lowercase();
-            if let Some(idx) = name_lower.rfind(|c: char| c.is_whitespace()) {
-                let suffix = &name[idx + 1..];
-                if suffix.len() <= 2 {
-                    return Some(suffix.to_lowercase());
-                }
-            }
-            // Check if name is just a single letter/number
-            if name.len() <= 2 && name.chars().all(|c| c.is_alphanumeric()) {
-                return Some(name.to_lowercase());
-            }
-            None
-        });
-
-        // Try the closest stations
-        for station in stations.iter().take(3) {
-            let station_ifopt = match station.ifopt() {
-                Some(id) => id,
-                None => continue,
-            };
-            let station_distance = station.distance_meters();
-
-            // Query platforms for this station
-            match self.efa_client.get_station_platforms(station_ifopt).await {
-                Ok(platforms) => {
-                    // If we have an OSM ref, try to match it to a platform
-                    if let Some(ref osm_ref) = osm_ref {
-                        for platform in &platforms {
-                            if let Some(ref efa_ref) = platform.platform {
-                                if efa_ref.to_lowercase() == *osm_ref {
-                                    let name = platform.name.clone()
-                                        .or_else(|| platform.station_name.clone());
-                                    return Some((platform.ifopt.clone(), name, station_distance));
-                                }
-                            }
-                        }
-                    }
-
-                    // If only one platform, suggest it
-                    if platforms.len() == 1 {
-                        let platform = &platforms[0];
-                        let name = platform.name.clone()
-                            .or_else(|| platform.station_name.clone());
-                        return Some((platform.ifopt.clone(), name, station_distance));
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        station = station_ifopt,
-                        error = %e,
-                        "Failed to query platforms for station"
-                    );
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Find station-level IFOPT match from EFA locations
-    /// Returns (ifopt, name, distance) if a good match is found
-    fn find_station_ifopt_match(
-        &self,
-        locations: &[crate::providers::timetables::germany::bavaria::CoordLocation],
-        osm_name: &Option<String>,
-    ) -> Option<(String, Option<String>, Option<u32>)> {
-        if locations.is_empty() {
-            return None;
-        }
-
-        // If we have an OSM name, try to find a matching EFA stop
-        if let Some(osm_name) = osm_name {
-            let osm_name_lower = osm_name.to_lowercase();
-
-            for loc in locations {
-                if let Some(ifopt) = loc.ifopt() {
-                    let distance = loc.distance_meters();
-
-                    // Check if name matches (exact or partial)
-                    let efa_name = loc.name.as_deref().unwrap_or("");
-                    let efa_name_lower = efa_name.to_lowercase();
-
-                    // Consider it a match if:
-                    // 1. Names are exactly equal (case insensitive)
-                    // 2. One name contains the other
-                    // 3. Distance is very close (<50m) - likely the same stop
-                    let name_matches = osm_name_lower == efa_name_lower
-                        || osm_name_lower.contains(&efa_name_lower)
-                        || efa_name_lower.contains(&osm_name_lower);
-
-                    let very_close = distance.map_or(false, |d| d < 50);
-
-                    if name_matches || very_close {
-                        return Some((
-                            ifopt.to_string(),
-                            loc.full_name().map(|s| s.to_string()),
-                            distance,
-                        ));
-                    }
-                }
-            }
-        }
-
-        // If no name match, use the closest stop if within 100m
-        let closest = locations.first()?;
-        let distance = closest.distance_meters()?;
-
-        if distance <= 100 {
-            if let Some(ifopt) = closest.ifopt() {
-                return Some((
-                    ifopt.to_string(),
-                    closest.full_name().map(|s| s.to_string()),
-                    Some(distance),
-                ));
-            }
-        }
-
-        None
     }
 
     /// Sync a single area (all database operations in a single transaction)
@@ -407,7 +337,7 @@ impl SyncManager {
             .pool
             .begin()
             .await
-            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+            ?;
 
         // Ensure area exists in database
         let area_id = self.upsert_area(&mut tx, area).await?;
@@ -429,12 +359,12 @@ impl SyncManager {
             .bind(area_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+            ?;
 
         // Commit all changes atomically
         tx.commit()
             .await
-            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+            ?;
 
         info!(area = %area.name, "Completed sync for area");
         Ok(())
@@ -465,7 +395,7 @@ impl SyncManager {
         .bind(area.bounding_box.east)
         .fetch_one(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         Ok(sqlx::Row::get(&result, "id"))
     }
@@ -494,7 +424,7 @@ impl SyncManager {
                         &station.element_type,
                         "station",
                         OsmIssueType::MissingCoordinates,
-                        transport_type.clone(),
+                        transport_type,
                         format!("Station '{}' has no coordinates", name.as_deref().unwrap_or("unnamed")),
                         name,
                         None, // ref_tag
@@ -552,7 +482,7 @@ impl SyncManager {
             .bind(area_id)
             .execute(&mut **tx)
             .await
-            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+            ?;
         }
 
         // Store collected issues
@@ -590,7 +520,7 @@ impl SyncManager {
                         &platform.element_type,
                         "platform",
                         OsmIssueType::MissingCoordinates,
-                        transport_type.clone(),
+                        transport_type,
                         format!("Platform '{}' has no coordinates", name.as_deref().unwrap_or("unnamed")),
                         name,
                         platform_ref,
@@ -608,7 +538,7 @@ impl SyncManager {
                     &platform.element_type,
                     "platform",
                     OsmIssueType::MissingIfopt,
-                    transport_type.clone(),
+                    transport_type,
                     format!("Platform '{}' has no ref:IFOPT tag", name.as_deref().unwrap_or("unnamed")),
                     name.clone(),
                     platform_ref.clone(),
@@ -671,7 +601,7 @@ impl SyncManager {
             .bind(area_id)
             .execute(&mut **tx)
             .await
-            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+            ?;
         }
 
         // Store collected issues
@@ -709,7 +639,7 @@ impl SyncManager {
                         &stop.element_type,
                         "stop_position",
                         OsmIssueType::MissingCoordinates,
-                        transport_type.clone(),
+                        transport_type,
                         format!("Stop position '{}' has no coordinates", name.as_deref().unwrap_or("unnamed")),
                         name,
                         stop_ref,
@@ -727,7 +657,7 @@ impl SyncManager {
                     &stop.element_type,
                     "stop_position",
                     OsmIssueType::MissingIfopt,
-                    transport_type.clone(),
+                    transport_type,
                     format!("Stop position '{}' has no ref:IFOPT tag", name.as_deref().unwrap_or("unnamed")),
                     name.clone(),
                     stop_ref.clone(),
@@ -790,7 +720,7 @@ impl SyncManager {
             .bind(area_id)
             .execute(&mut **tx)
             .await
-            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+            ?;
         }
 
         // Store collected issues
@@ -864,20 +794,20 @@ impl SyncManager {
             .bind(area_id)
             .execute(&mut **tx)
             .await
-            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+            ?;
 
             // Delete existing ways and stops for this route
             sqlx::query("DELETE FROM route_ways WHERE route_id = ?")
                 .bind(route.osm_id)
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+                ?;
 
             sqlx::query("DELETE FROM route_stops WHERE route_id = ?")
                 .bind(route.osm_id)
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+                ?;
 
             // Insert ways
             for way in &route.ways {
@@ -904,10 +834,10 @@ impl SyncManager {
                 .bind(&geometry_json)
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+                ?;
             }
 
-            // Insert stops - use subquery to only reference existing stop_positions (returns NULL if not found)
+            // Insert stops
             for stop in &route.stops {
                 sqlx::query(
                     r#"
@@ -926,7 +856,7 @@ impl SyncManager {
                 .bind(&stop.role)
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+                ?;
             }
         }
 
@@ -954,7 +884,7 @@ impl SyncManager {
         .bind(area_id)
         .fetch_all(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         // Link platforms to nearest station
         let platforms: Vec<(i64, f64, f64)> = sqlx::query_as(
@@ -963,13 +893,12 @@ impl SyncManager {
         .bind(area_id)
         .fetch_all(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         // Max distance for fallback linking: ~500m ≈ 0.005 degrees
         let max_station_distance = 0.005_f64.powi(2);
 
         for (platform_id, plat, plon) in &platforms {
-            // Find nearest station within max distance
             if let Some((station_id, _, _)) = stations
                 .iter()
                 .filter(|(_, slat, slon)| {
@@ -978,7 +907,6 @@ impl SyncManager {
                 .min_by(|a, b| {
                     let dist_a = (plat - a.1).powi(2) + (plon - a.2).powi(2);
                     let dist_b = (plat - b.1).powi(2) + (plon - b.2).powi(2);
-                    // Use unwrap_or to handle NaN - treat NaN as greater
                     dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Greater)
                 })
             {
@@ -987,7 +915,7 @@ impl SyncManager {
                     .bind(platform_id)
                     .execute(&mut **tx)
                     .await
-                    .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+                    ?;
             }
         }
 
@@ -998,7 +926,7 @@ impl SyncManager {
         .bind(area_id)
         .fetch_all(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         // Link stop_positions to nearest platform (within ~50m)
         let stop_positions: Vec<(i64, f64, f64)> = sqlx::query_as(
@@ -1007,9 +935,8 @@ impl SyncManager {
         .bind(area_id)
         .fetch_all(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
-        // Threshold for stop_position to platform linking: ~50m ≈ 0.0005 degrees
         let platform_threshold = 0.0005_f64.powi(2);
 
         for (stop_id, slat, slon) in &stop_positions {
@@ -1021,7 +948,6 @@ impl SyncManager {
                 .min_by(|a, b| {
                     let dist_a = (slat - a.1).powi(2) + (slon - a.2).powi(2);
                     let dist_b = (slat - b.1).powi(2) + (slon - b.2).powi(2);
-                    // Use unwrap_or to handle NaN - treat NaN as greater
                     dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Greater)
                 })
             {
@@ -1030,7 +956,7 @@ impl SyncManager {
                     .bind(stop_id)
                     .execute(&mut **tx)
                     .await
-                    .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+                    ?;
             }
         }
 
@@ -1047,7 +973,7 @@ impl SyncManager {
         .bind(area_id)
         .execute(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         // Resolve route_stops references from stop_positions
         sqlx::query(
@@ -1065,7 +991,7 @@ impl SyncManager {
         .bind(area_id)
         .execute(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         // For stops that reference platforms directly
         sqlx::query(
@@ -1083,19 +1009,18 @@ impl SyncManager {
         .bind(area_id)
         .execute(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         // Detect orphaned elements (still unlinked after fallback)
         let mut new_issues = Vec::new();
 
-        // Find orphaned platforms (no station_id after all linking attempts)
         let orphaned_platforms: Vec<(i64, String, Option<String>, Option<String>, f64, f64)> = sqlx::query_as(
             "SELECT osm_id, osm_type, name, ref, lat, lon FROM platforms WHERE area_id = ? AND station_id IS NULL",
         )
         .bind(area_id)
         .fetch_all(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         for (osm_id, osm_type, name, ref_tag, lat, lon) in orphaned_platforms {
             new_issues.push(OsmIssue::new(
@@ -1103,7 +1028,7 @@ impl SyncManager {
                 &osm_type,
                 "platform",
                 OsmIssueType::OrphanedElement,
-                TransportType::Unknown, // Transport type unknown for orphaned elements from DB query
+                TransportType::Unknown,
                 format!("Platform '{}' is not linked to any station (no stop_area relation and no station within 500m)", name.as_deref().unwrap_or("unnamed")),
                 name,
                 ref_tag,
@@ -1112,14 +1037,13 @@ impl SyncManager {
             ));
         }
 
-        // Find orphaned stop_positions (no station_id after all linking attempts)
         let orphaned_stops: Vec<(i64, String, Option<String>, Option<String>, f64, f64)> = sqlx::query_as(
             "SELECT osm_id, osm_type, name, ref, lat, lon FROM stop_positions WHERE area_id = ? AND station_id IS NULL",
         )
         .bind(area_id)
         .fetch_all(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         for (osm_id, osm_type, name, ref_tag, lat, lon) in orphaned_stops {
             new_issues.push(OsmIssue::new(
@@ -1127,7 +1051,7 @@ impl SyncManager {
                 &osm_type,
                 "stop_position",
                 OsmIssueType::OrphanedElement,
-                TransportType::Unknown, // Transport type unknown for orphaned elements from DB query
+                TransportType::Unknown,
                 format!("Stop position '{}' is not linked to any station", name.as_deref().unwrap_or("unnamed")),
                 name,
                 ref_tag,
@@ -1136,7 +1060,6 @@ impl SyncManager {
             ));
         }
 
-        // Store collected issues
         if !new_issues.is_empty() {
             let mut issues = self.issues.write().await;
             issues.extend(new_issues);
@@ -1154,10 +1077,8 @@ impl SyncManager {
     ) -> Result<(), SyncError> {
         let mut new_issues = Vec::new();
 
-        // Distance threshold for nearby check: ~100m ≈ 0.001 degrees
         let nearby_threshold = 0.001;
 
-        // Find platforms without any stop_position nearby (using coordinate check)
         let platforms_without_stops: Vec<(i64, String, Option<String>, Option<String>, Option<String>, f64, f64)> = sqlx::query_as(
             r#"
             SELECT p.osm_id, p.osm_type, p.name, p.ref, p.ref_ifopt, p.lat, p.lon
@@ -1177,7 +1098,7 @@ impl SyncManager {
         .bind(nearby_threshold)
         .fetch_all(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         for (osm_id, osm_type, name, ref_tag, _ref_ifopt, lat, lon) in platforms_without_stops {
             new_issues.push(OsmIssue::new(
@@ -1194,7 +1115,6 @@ impl SyncManager {
             ));
         }
 
-        // Find stop_positions without any platform nearby (using coordinate check)
         let stops_without_platforms: Vec<(i64, String, Option<String>, Option<String>, Option<String>, f64, f64)> = sqlx::query_as(
             r#"
             SELECT sp.osm_id, sp.osm_type, sp.name, sp.ref, sp.ref_ifopt, sp.lat, sp.lon
@@ -1214,7 +1134,7 @@ impl SyncManager {
         .bind(nearby_threshold)
         .fetch_all(&mut **tx)
         .await
-        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        ?;
 
         for (osm_id, osm_type, name, ref_tag, _ref_ifopt, lat, lon) in stops_without_platforms {
             new_issues.push(OsmIssue::new(
@@ -1231,7 +1151,6 @@ impl SyncManager {
             ));
         }
 
-        // Store collected issues
         if !new_issues.is_empty() {
             let mut issues = self.issues.write().await;
             issues.extend(new_issues);
@@ -1240,329 +1159,14 @@ impl SyncManager {
         info!("Checked platform/stop_position pairs for area {}", area_id);
         Ok(())
     }
-
-    /// Sync departures for all stations
-    async fn sync_all_departures(&self) {
-        info!("Starting departure sync");
-
-        // Get all unique stop IFOPTs from stations, platforms, and stop_positions
-        let stop_ifopts: Vec<(String,)> = match sqlx::query_as(
-            r#"
-            SELECT DISTINCT ref_ifopt
-            FROM stations
-            WHERE ref_ifopt IS NOT NULL
-            UNION
-            SELECT DISTINCT ref_ifopt
-            FROM platforms
-            WHERE ref_ifopt IS NOT NULL
-            UNION
-            SELECT DISTINCT ref_ifopt
-            FROM stop_positions
-            WHERE ref_ifopt IS NOT NULL
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!(error = %e, "Failed to fetch stop IFOPTs for departure sync");
-                return;
-            }
-        };
-
-        if stop_ifopts.is_empty() {
-            warn!("No stop IFOPTs found for departure sync");
-            return;
-        }
-
-        // Extract station-level IFOPTs (first 3 parts: de:09761:691)
-        // EFA API works better with station-level IFOPTs and returns platform-level IFOPTs in response
-        let station_ifopts: Vec<String> = stop_ifopts
-            .into_iter()
-            .map(|(ifopt,)| {
-                // Take first 3 parts of IFOPT (de:XXXXX:NNN) to get station level
-                let parts: Vec<&str> = ifopt.split(':').collect();
-                if parts.len() >= 3 {
-                    format!("{}:{}:{}", parts[0], parts[1], parts[2])
-                } else {
-                    ifopt
-                }
-            })
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        // Read sync config
-        let efa_sync_config = {
-            let config = self.config.read().await;
-            config.efa_sync.clone()
-        };
-        let time_span = if efa_sync_config.time_span_minutes > 0 {
-            Some(efa_sync_config.time_span_minutes)
-        } else {
-            None
-        };
-
-        info!(
-            count = station_ifopts.len(),
-            limit = efa_sync_config.limit_per_stop,
-            time_span_minutes = ?time_span,
-            fetch_arrivals = efa_sync_config.fetch_arrivals,
-            "Fetching departures for stations"
-        );
-
-        // Fetch departures (always) and arrivals (if configured) concurrently
-        let departure_results = self
-            .efa_client
-            .get_departures_batch(
-                &station_ifopts,
-                efa_sync_config.limit_per_stop,
-                true,
-                time_span,
-            )
-            .await;
-
-        let arrival_results = if efa_sync_config.fetch_arrivals {
-            self.efa_client
-                .get_arrivals_batch(
-                    &station_ifopts,
-                    efa_sync_config.limit_per_stop,
-                    true,
-                    time_span,
-                )
-                .await
-        } else {
-            Vec::new()
-        };
-
-        let mut success_count = 0;
-        let mut error_count = 0;
-        let now = Utc::now();
-        // Events older than this are considered expired and will be removed
-        let expiry_cutoff = now - chrono::Duration::hours(2);
-
-        // Collect new events by platform, deduplicating as we go
-        // Key: (platform_ifopt, event_type), Value: HashMap<(line_number, planned_time), Departure>
-        let mut new_departures_by_platform: HashMap<String, HashMap<(String, String), Departure>> =
-            HashMap::new();
-        let mut new_arrivals_by_platform: HashMap<String, HashMap<(String, String), Departure>> =
-            HashMap::new();
-
-        // Process departures - collect and deduplicate by (line_number, planned_time)
-        for (station_ifopt, result) in departure_results {
-            match result {
-                Ok(response) => {
-                    let departures =
-                        self.parse_stop_events(&station_ifopt, &response.stop_events, now, EventType::Departure);
-
-                    for departure in departures {
-                        let platform_ifopt = departure.stop_ifopt.clone();
-                        let key = (departure.line_number.clone(), departure.planned_time.clone());
-                        new_departures_by_platform
-                            .entry(platform_ifopt)
-                            .or_default()
-                            .insert(key, departure);
-                    }
-                    success_count += 1;
-                }
-                Err(e) => {
-                    tracing::debug!(station = %station_ifopt, error = %e, "Failed to fetch departures, keeping existing data");
-                    error_count += 1;
-                }
-            }
-        }
-
-        // Process arrivals - collect and deduplicate by (line_number, planned_time)
-        for (station_ifopt, result) in arrival_results {
-            match result {
-                Ok(response) => {
-                    let arrivals =
-                        self.parse_stop_events(&station_ifopt, &response.stop_events, now, EventType::Arrival);
-
-                    for arrival in arrivals {
-                        let platform_ifopt = arrival.stop_ifopt.clone();
-                        let key = (arrival.line_number.clone(), arrival.planned_time.clone());
-                        new_arrivals_by_platform
-                            .entry(platform_ifopt)
-                            .or_default()
-                            .insert(key, arrival);
-                    }
-                    success_count += 1;
-                }
-                Err(e) => {
-                    tracing::debug!(station = %station_ifopt, error = %e, "Failed to fetch arrivals, keeping existing data");
-                    error_count += 1;
-                }
-            }
-        }
-
-        // Now update the store atomically per platform
-        let mut store = self.departures.write().await;
-
-        // Update departures for platforms we fetched
-        for (platform_ifopt, new_deps) in new_departures_by_platform {
-            let entry = store.entry(platform_ifopt).or_default();
-            // Remove old departures for this platform
-            entry.retain(|d| d.event_type != EventType::Departure);
-            // Add new deduplicated departures
-            entry.extend(new_deps.into_values());
-        }
-
-        // Update arrivals for platforms we fetched
-        for (platform_ifopt, new_arrs) in new_arrivals_by_platform {
-            let entry = store.entry(platform_ifopt).or_default();
-            // Remove old arrivals for this platform
-            entry.retain(|d| d.event_type != EventType::Arrival);
-            // Add new deduplicated arrivals
-            entry.extend(new_arrs.into_values());
-        }
-
-        // Time-based expiration: remove events that are too old (more than 2 hours past)
-        for events in store.values_mut() {
-            events.retain(|event| {
-                match DateTime::parse_from_rfc3339(&event.planned_time) {
-                    Ok(event_time) => event_time > expiry_cutoff,
-                    // Keep events with unparseable times (shouldn't happen, but defensive)
-                    Err(_) => true,
-                }
-            });
-        }
-
-        // Clean up stops with no events
-        store.retain(|_, events| !events.is_empty());
-
-        // Sort events by time for each stop
-        for events in store.values_mut() {
-            events.sort_by(|a, b| a.planned_time.cmp(&b.planned_time));
-        }
-
-        // Release lock before logging
-        drop(store);
-
-        // Broadcast vehicle update notification to all WebSocket clients
-        let update = VehicleUpdate {
-            timestamp: Utc::now().to_rfc3339(),
-            is_initial: false,
-        };
-        // Ignore send errors - they just mean no one is listening
-        let _ = self.vehicle_updates_tx.send(update);
-
-        info!(
-            success = success_count,
-            errors = error_count,
-            "Completed departure/arrival sync"
-        );
-    }
-
-    /// Parse stop events into Departure structs
-    /// Returns departures keyed by their actual platform IFOPT from the EFA response
-    fn parse_stop_events(
-        &self,
-        _station_ifopt: &str, // Station IFOPT we queried (kept for logging)
-        stop_events: &[crate::providers::timetables::germany::bavaria::StopEvent],
-        now: DateTime<Utc>,
-        event_type: EventType,
-    ) -> Vec<Departure> {
-        let mut events = Vec::new();
-
-        for event in stop_events {
-            // Use the actual platform IFOPT from the event location
-            let stop_ifopt = match event.location_ifopt() {
-                Some(id) => id,
-                None => continue, // Skip events without location ID
-            };
-            let line_number = match event.line_number() {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-
-            // For departures, use destination; for arrivals, use origin
-            let destination = match event_type {
-                EventType::Departure => match event.destination() {
-                    Some(d) => d.to_string(),
-                    None => continue,
-                },
-                EventType::Arrival => match event.origin() {
-                    Some(o) => o.to_string(),
-                    None => continue,
-                },
-            };
-
-            // Get planned and estimated times based on event type
-            let (planned, estimated) = match event_type {
-                EventType::Departure => (
-                    event.planned_departure().map(|s| s.to_string()),
-                    event.estimated_departure().map(|s| s.to_string()),
-                ),
-                EventType::Arrival => (
-                    event.planned_arrival().map(|s| s.to_string()),
-                    event.estimated_arrival().map(|s| s.to_string()),
-                ),
-            };
-
-            let planned = match planned {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // Skip events in the past
-            if let Ok(planned_dt) = DateTime::parse_from_rfc3339(&planned) {
-                if planned_dt < now {
-                    continue;
-                }
-            }
-
-            let platform = event.platform().map(|s| s.to_string());
-
-            // Calculate delay in minutes if we have both planned and estimated times
-            let delay_minutes = match (&planned, &estimated) {
-                (p, Some(e)) => {
-                    if let (Ok(planned_dt), Ok(estimated_dt)) = (
-                        DateTime::parse_from_rfc3339(p),
-                        DateTime::parse_from_rfc3339(e),
-                    ) {
-                        Some(
-                            (estimated_dt.signed_duration_since(planned_dt).num_seconds() / 60)
-                                as i32,
-                        )
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-
-            // Get destination/origin ID based on event type
-            let destination_id = match event_type {
-                EventType::Departure => event.destination_id().map(|s| s.to_string()),
-                EventType::Arrival => event.origin_id().map(|s| s.to_string()),
-            };
-
-            events.push(Departure {
-                stop_ifopt: stop_ifopt.to_string(),
-                event_type,
-                line_number,
-                destination,
-                destination_id,
-                planned_time: planned,
-                estimated_time: estimated,
-                delay_minutes,
-                platform,
-                trip_id: event.trip_id().map(|s| s.to_string()),
-            });
-        }
-
-        events
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error("OSM fetch error: {0}")]
     OsmError(String),
-    #[error("EFA fetch error: {0}")]
-    EfaError(String),
+    #[error("GTFS error: {0}")]
+    GtfsError(#[from] crate::providers::timetables::gtfs::error::GtfsError),
     #[error("Database error: {0}")]
-    DatabaseError(String),
+    DatabaseError(#[from] sqlx::Error),
 }

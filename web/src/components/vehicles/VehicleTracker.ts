@@ -28,6 +28,7 @@ export class VehicleTracker {
     private map: maplibregl.Map;
     private callbacks: TrackingCallbacks;
     private tripId: string | null = null;
+    private simulatedTime: Date = new Date();
 
     // Animation state
     private trackingAnimationId: number | null = null;
@@ -111,6 +112,13 @@ export class VehicleTracker {
      */
     getTrackedTripId(): string | null {
         return this.tripId;
+    }
+
+    /**
+     * Update the simulated time used for countdown calculations
+     */
+    setSimulatedTime(time: Date): void {
+        this.simulatedTime = time;
     }
 
     /**
@@ -243,7 +251,7 @@ export class VehicleTracker {
                     const arrivalTimeStr = trackedPosition.nextStop.arrival_time_estimated || trackedPosition.nextStop.arrival_time;
                     if (arrivalTimeStr) {
                         const arrivalTime = new Date(arrivalTimeStr).getTime();
-                        secondsToNextStop = Math.max(0, Math.round((arrivalTime - Date.now()) / 1000));
+                        secondsToNextStop = Math.max(0, Math.round((arrivalTime - this.simulatedTime.getTime()) / 1000));
                     }
                 }
 

@@ -52,11 +52,11 @@ pub struct OsmIssue {
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub detected_at: String,
-    /// Suggested IFOPT from EFA API (for missing_ifopt issues)
+    /// Suggested IFOPT (for missing_ifopt issues)
     pub suggested_ifopt: Option<String>,
-    /// Name of the EFA stop that was matched
+    /// Name of the stop that was matched
     pub suggested_ifopt_name: Option<String>,
-    /// Distance in meters to the suggested EFA stop
+    /// Distance in meters to the suggested stop
     pub suggested_ifopt_distance: Option<u32>,
 }
 

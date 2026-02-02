@@ -16,6 +16,8 @@ interface PlatformPopupProps {
     platform: StationPlatform | StationStopPosition;
     stationName?: string;
     routeColors: globalThis.Map<string, string>;
+    /** When set, requests schedule-based departures for this simulated time */
+    referenceTime?: Date;
 }
 
 interface TripEvent {
@@ -27,7 +29,7 @@ interface TripEvent {
     delayMinutes: number | null;
 }
 
-export function PlatformPopup({ platform, stationName, routeColors }: PlatformPopupProps) {
+export function PlatformPopup({ platform, stationName, routeColors, referenceTime }: PlatformPopupProps) {
     const [events, setEvents] = useState<Departure[]>([]);
     const [loading, setLoading] = useState(true);
     const displayName = getPlatformDisplayName(platform);
@@ -77,7 +79,10 @@ export function PlatformPopup({ platform, stationName, routeColors }: PlatformPo
         }
 
         getApi().api
-            .getDeparturesByStop({ stop_ifopt: platform.ref_ifopt })
+            .getDeparturesByStop({
+                stop_ifopt: platform.ref_ifopt,
+                reference_time: referenceTime ? referenceTime.toISOString() : undefined,
+            })
             .then((res) => {
                 setEvents(res.data?.departures ?? []);
             })
@@ -88,7 +93,7 @@ export function PlatformPopup({ platform, stationName, routeColors }: PlatformPo
             .finally(() => {
                 setLoading(false);
             });
-    }, [platform.ref_ifopt]);
+    }, [platform.ref_ifopt, referenceTime]);
 
     return (
         <div className="p-4 pr-8 bg-popover text-popover-foreground rounded-lg">

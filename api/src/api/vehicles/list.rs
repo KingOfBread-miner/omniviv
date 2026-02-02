@@ -1,17 +1,22 @@
 use axum::{extract::State, http::StatusCode, Json};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
 
 use super::VehiclesState;
 use crate::api::ErrorResponse;
+use crate::providers::timetables::gtfs::realtime;
 use crate::sync::{Departure, EventType};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct VehiclesByRouteRequest {
     /// The OSM route ID to get vehicles for
     pub route_id: i64,
+    /// Optional reference time (ISO 8601/RFC 3339) for time simulation.
+    /// When provided, departures are computed from the static GTFS schedule.
+    pub reference_time: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -23,7 +28,7 @@ pub struct VehiclesByRouteResponse {
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Vehicle {
-    /// Unique trip identifier (AVMSTripID from EFA)
+    /// Unique trip identifier (GTFS trip_id)
     pub trip_id: String,
     /// Line number (e.g., "1", "2", "3")
     pub line_number: String,
@@ -164,37 +169,67 @@ pub async fn get_vehicles_by_route(
         }));
     }
 
-    // Get departures from the store and filter by route stops
-    // Clone the data to release the lock quickly
-    let trip_departures: HashMap<String, Vec<Departure>> = {
-        let store = state.departure_store.read().await;
+    // Determine if we're using simulated time
+    let simulated_time = parse_simulated_time(&request.reference_time);
 
+    // Get departures either from the store (real-time) or schedule (simulated time)
+    let trip_departures: HashMap<String, Vec<Departure>> = if let Some(ref_time) = simulated_time {
+        // Compute departures from static schedule for the simulated time
+        let schedule_guard = state.schedule_store.read().await;
+        match schedule_guard.as_ref() {
+            Some(schedule) => {
+                let stop_ids: HashSet<String> = stop_ifopts.iter().map(|s| s.to_string()).collect();
+                let time_horizon = Duration::minutes(state.time_horizon_minutes as i64);
+                let all_departures = realtime::compute_schedule_departures(
+                    schedule,
+                    &stop_ids,
+                    ref_time,
+                    time_horizon,
+                    state.timezone,
+                );
+
+                let mut result: HashMap<String, Vec<Departure>> = HashMap::new();
+                for ifopt in &stop_ifopts {
+                    if let Some(departures) = all_departures.get(*ifopt) {
+                        for dep in departures {
+                            let trip_id = match &dep.trip_id {
+                                Some(id) => id,
+                                None => continue,
+                            };
+                            if let Some(ref line_ref) = route_info.line_ref {
+                                if &dep.line_number != line_ref {
+                                    continue;
+                                }
+                            }
+                            result.entry(trip_id.clone()).or_default().push(dep.clone());
+                        }
+                    }
+                }
+                result
+            }
+            None => HashMap::new(),
+        }
+    } else {
+        // Use real-time departure store
+        let store = state.departure_store.read().await;
         let mut result: HashMap<String, Vec<Departure>> = HashMap::new();
 
         for ifopt in &stop_ifopts {
             if let Some(departures) = store.get(*ifopt) {
                 for dep in departures {
-                    // Skip if no trip_id
                     let trip_id = match &dep.trip_id {
                         Some(id) => id,
                         None => continue,
                     };
-
-                    // If we know the line number, filter by it
                     if let Some(ref line_ref) = route_info.line_ref {
                         if &dep.line_number != line_ref {
                             continue;
                         }
                     }
-
-                    result
-                        .entry(trip_id.clone())
-                        .or_default()
-                        .push(dep.clone());
+                    result.entry(trip_id.clone()).or_default().push(dep.clone());
                 }
             }
         }
-
         result
     };
 
@@ -285,4 +320,18 @@ pub async fn get_vehicles_by_route(
         line_number: route_info.line_ref,
         vehicles,
     }))
+}
+
+/// Parse a reference_time string and determine if it's a simulated (non-current) time.
+fn parse_simulated_time(reference_time: &Option<String>) -> Option<DateTime<Utc>> {
+    let rt = reference_time.as_ref()?;
+    let parsed = DateTime::parse_from_rfc3339(rt).ok()?;
+    let dt = parsed.with_timezone(&Utc);
+
+    // If the reference time is within 3 minutes of now, treat it as real-time
+    let diff = (dt - Utc::now()).num_seconds().abs();
+    if diff < 180 {
+        return None;
+    }
+    Some(dt)
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use utoipa::ToSchema;
 
+
 /// Type of stop event
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -28,7 +29,7 @@ pub struct Departure {
     pub estimated_time: Option<String>,
     pub delay_minutes: Option<i32>,
     pub platform: Option<String>,
-    /// Unique trip identifier (AVMSTripID) - consistent across all stops for a journey
+    /// Unique trip identifier (GTFS trip_id) - consistent across all stops for a journey
     pub trip_id: Option<String>,
 }
 
@@ -45,6 +46,9 @@ impl Departure {
 /// In-memory store for departure data
 pub type DepartureStore = Arc<RwLock<HashMap<String, Vec<Departure>>>>;
 
+/// Shared reference to the GTFS schedule for computing departures at arbitrary times
+pub type ScheduleStore = Arc<RwLock<Option<crate::providers::timetables::gtfs::static_data::GtfsSchedule>>>;
+
 /// Update notification for vehicle data changes
 #[derive(Debug, Clone, Serialize)]
 pub struct VehicleUpdate {
@@ -57,28 +61,3 @@ pub struct VehicleUpdate {
 /// Sender for vehicle update notifications
 pub type VehicleUpdateSender = broadcast::Sender<VehicleUpdate>;
 
-/// EFA API request log for diagnostics
-#[derive(Debug, Clone, Serialize)]
-pub struct EfaRequestLog {
-    /// Unique request ID
-    pub id: String,
-    /// Timestamp when request was made
-    pub timestamp: String,
-    /// HTTP method (GET, POST)
-    pub method: String,
-    /// API endpoint called
-    pub endpoint: String,
-    /// Request parameters
-    pub params: Option<HashMap<String, String>>,
-    /// Duration of request in milliseconds
-    pub duration_ms: u64,
-    /// HTTP status code
-    pub status: u16,
-    /// Response size in bytes
-    pub response_size: Option<usize>,
-    /// Error message if request failed
-    pub error: Option<String>,
-}
-
-/// Sender for EFA request diagnostics
-pub type EfaRequestSender = broadcast::Sender<EfaRequestLog>;
